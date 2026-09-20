@@ -1,10 +1,41 @@
-# Skipped when an enclosing build already supplies GoogleTest — a bundled
-# build fetches it from source, because a machine with no package manager (any
-# Windows runner) has nothing for find_package to find, and REQUIRED would fail
-# the configure outright.
+# GoogleTest is a dependency of the tests, not of the server, so it is resolved
+# here rather than in cmake/bundled_deps.cmake — nothing it provides reaches the
+# shipped executable, and tying it to OMLE_SERVER_BUNDLE_DEPS would mean the
+# tests could only be built in the mode used for release artifacts.
+#
+# Prefer an installed copy, fall back to source. The fallback is what makes
+# -DBUILD_SERVER_TESTS=ON work on a machine with no package manager, Windows in
+# particular, where find_package(GTest REQUIRED) would fail the configure.
 if(NOT TARGET GTest::GTest AND NOT TARGET gtest)
-  find_package(GTest REQUIRED)
+  find_package(GTest QUIET)
 endif()
+
+if(NOT TARGET GTest::GTest AND NOT TARGET gtest)
+  message(STATUS "GTest not found; fetching it from source")
+  include(FetchContent)
+  # GoogleTest links the shared CRT by default on MSVC. The server and its
+  # dependencies use the static one in a bundled build, and mixing the two is a
+  # link error rather than a warning.
+  set(gtest_force_shared_crt OFF CACHE BOOL "" FORCE)
+  set(INSTALL_GTEST          OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(googletest
+      GIT_REPOSITORY https://github.com/google/googletest.git
+      GIT_TAG        v1.15.2
+      GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(googletest)
+endif()
+
+# find_package spells these GTest::GTest / GTest::Main; the subproject defines
+# gtest / gtest_main. Alias so add_server_test() below reads the same either way.
+foreach(_pair "GTest::GTest=gtest" "GTest::Main=gtest_main")
+  string(REPLACE "=" ";" _parts "${_pair}")
+  list(GET _parts 0 _alias)
+  list(GET _parts 1 _real)
+  if(NOT TARGET ${_alias} AND TARGET ${_real})
+    add_library(${_alias} ALIAS ${_real})
+  endif()
+endforeach()
 
 # ── Helper for unit tests (link GTest::Main, no custom main) ──────────────────
 

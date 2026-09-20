@@ -1,6 +1,11 @@
 #include "omle_server/metrics.h"
 
 #include <iomanip>
+// std::unique_lock lives here. metrics.h includes <shared_mutex> for the mutex
+// itself, and libc++ happens to pull <mutex> in behind it — libstdc++ does not,
+// so without this the file compiles on macOS and fails on Linux with
+// "'unique_lock' is not a member of 'std'".
+#include <mutex>
 #include <sstream>
 
 namespace omle_server {

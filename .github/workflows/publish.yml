@@ -14,7 +14,14 @@ name: Publish omle-server
 #     binary needs gRPC, Abseil, protobuf and Drogon installed at matching
 #     versions — 112 shared libraries — which is not something a `pip install`
 #     can arrange. The bundled build links all of them statically and leaves
-#     only OpenSSL, jsoncpp and system libraries external.
+#     only OpenSSL and system libraries external.
+#
+#   * OpenSSL is deliberately NOT vendored into the wheel. A bundled libssl
+#     stops receiving the distribution's security updates and can only be
+#     patched by cutting a new release, so the wheel links the system copy and
+#     the repair steps below exclude it. Installing needs OpenSSL 3 present:
+#     it is part of every current distribution and of the macOS Homebrew
+#     baseline, so this is a dependency to declare, not to carry.
 #
 #   * Linux wheels are built inside the manylinux_2_28 image. A wheel built on
 #     the bare runner would be tagged for that runner's glibc (2.39 on
@@ -91,11 +98,18 @@ jobs:
       - name: Install the toolchain (manylinux)
         if: runner.os == 'Linux'
         run: |
-          dnf install -y cmake ninja-build git openssl-devel jsoncpp-devel
+          # jsoncpp is NOT installed: bundled_deps.cmake vendors it, and a
+          # system copy is what it exists to avoid. libuuid and zlib are needed
+          # because Drogon's own CMakeLists calls find_package(UUID REQUIRED)
+          # and find_package(ZLIB REQUIRED) on Linux — it builds from source
+          # here but still resolves those two against the system.
+          dnf install -y cmake ninja-build git openssl-devel libuuid-devel zlib-devel
 
       - name: Install the toolchain (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake ninja jsoncpp openssl@3
+        # No jsoncpp here either — vendored. macOS supplies UUID and zlib in
+        # the SDK, so only OpenSSL has to be installed.
+        run: brew install cmake ninja openssl@3
 
       - uses: actions/setup-python@v5.6.0
         if: runner.os == 'macOS'
@@ -145,22 +159,28 @@ jobs:
           chmod 755 python/omle_server/bin/omle_server
           cd python && python3 -m build --wheel
 
-      # Vendors the remaining external libraries (OpenSSL, jsoncpp) into the
-      # wheel and rewrites the binary's load paths, and on Linux retags the
-      # wheel to the manylinux baseline PyPI accepts.
+      # Retags the wheel to the manylinux baseline PyPI accepts. --exclude
+      # keeps OpenSSL out: auditwheel would otherwise copy libssl/libcrypto in
+      # and the wheel would carry a crypto library frozen at build time.
       - name: Repair the wheel (Linux)
         if: runner.os == 'Linux'
         working-directory: omle-server/python
         run: |
           python3 -m pip install auditwheel
-          auditwheel repair dist/*.whl -w wheelhouse/ --plat manylinux_2_28_${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+          auditwheel repair dist/*.whl -w wheelhouse/ \
+            --plat manylinux_2_28_${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }} \
+            --exclude libssl.so.3 --exclude libcrypto.so.3
 
       - name: Repair the wheel (macOS)
         if: runner.os == 'macOS'
         working-directory: omle-server/python
+        # --exclude matches on path substring, so these cover libssl.3.dylib
+        # and libcrypto.3.dylib wherever Homebrew put them.
         run: |
           python3 -m pip install delocate
-          delocate-wheel -w wheelhouse/ -v dist/*.whl
+          delocate-wheel -w wheelhouse/ -v \
+            --exclude libssl --exclude libcrypto \
+            dist/*.whl
 
       - name: Show what shipped
         working-directory: omle-server/python

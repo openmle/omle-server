@@ -34,14 +34,28 @@ endif()
 message(STATUS "grpc_cpp_plugin: ${GRPC_CPP_PLUGIN_EXECUTABLE}")
 
 # ── Drogon ────────────────────────────────────────────────────────────────────
-find_package(Drogon CONFIG)
-if(NOT Drogon_FOUND)
-    message(FATAL_ERROR
-        "Drogon not found.\n"
-        "  macOS:  brew install drogon\n"
-        "  Ubuntu: apt install libdrogon-dev\n"
-    )
-endif()
+# REQUIRED rather than a hand-written error. Without it a failure inside
+# DrogonConfig.cmake is swallowed and all that reaches the user is
+# "Drogon not found", which points at the wrong thing: the usual cause is not a
+# missing libdrogon-dev but one of its transitive dependencies. Ubuntu builds
+# Drogon with ORM support, so its config resolves PostgreSQL, SQLite, MySQL,
+# Boost, Hiredis and yaml-cpp, and any one of them failing looks identical.
+# REQUIRED lets the real message through, naming the dependency that failed.
+find_package(Drogon CONFIG REQUIRED)
+
+# Reaching here means Drogon resolved. What follows is for the reader who hits
+# a find_dependency failure above and needs to know what to install:
+#
+#   macOS:  brew install drogon
+#   Ubuntu: apt install libdrogon-dev libjsoncpp-dev uuid-dev zlib1g-dev \
+#                       libpq-dev libsqlite3-dev libmariadb-dev \
+#                       libmariadb-dev-compat libhiredis-dev libyaml-cpp-dev \
+#                       libboost-dev libbrotli-dev
+#
+# The Ubuntu list is long because of that ORM build, not because this server
+# uses any of it. libmariadb-dev-compat is the surprising entry: Drogon's
+# FindMySQL wants the mysql_config script, which default-libmysqlclient-dev
+# does not ship.
 
 # ── simdjson ─────────────────────────────────────────────────────────────────
 find_package(simdjson CONFIG

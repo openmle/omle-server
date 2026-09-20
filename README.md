@@ -9,6 +9,27 @@ Built on top of **omle-runtime** for model execution,
 
 ---
 
+## Installation
+
+```bash
+pip install omle-server
+omle-server                        # configs/server.json, or built-in defaults
+```
+
+The wheel carries a statically linked executable — gRPC, Abseil, protobuf,
+Drogon, jsoncpp, simdjson and the OMLE runtime are all inside it.
+
+**OpenSSL 3 must be present on the system.** It is the one library deliberately
+left dynamic: bundling it would freeze a cryptographic library at build time,
+cut off from the operating system's security updates and patchable only by
+cutting a new release. Every current distribution ships it (`libssl3` on
+Debian/Ubuntu, `openssl-libs` on Fedora/RHEL, `openssl@3` on Homebrew).
+
+Wheels cover linux-x86_64, linux-aarch64 and macos-arm64; anything else builds
+from source.
+
+---
+
 ## Architecture
 
 ```
@@ -85,7 +106,22 @@ Two conventions are supported:
 # macOS
 brew install drogon nlohmann-json simdjson
 conda install -c conda-forge grpc-cpp   # or via conda base env
+
+# Ubuntu — the long tail is Drogon's, not this project's. Ubuntu builds
+# libdrogon-dev with ORM support, so its CMake config insists on PostgreSQL,
+# SQLite, MySQL, Boost, Hiredis and yaml-cpp headers even though the server
+# touches no database. libmariadb-dev-compat supplies the mysql_config script
+# that Drogon's FindMySQL looks for; default-libmysqlclient-dev does not.
+apt install libdrogon-dev libjsoncpp-dev uuid-dev zlib1g-dev \
+            libpq-dev libsqlite3-dev libmariadb-dev libmariadb-dev-compat \
+            libhiredis-dev libyaml-cpp-dev libboost-dev libbrotli-dev \
+            libgrpc++-dev protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
+            libgtest-dev libsimdjson-dev nlohmann-json3-dev
 ```
+
+If that list is unwelcome, `-DOMLE_SERVER_BUNDLE_DEPS=ON` builds every
+dependency from pinned source and needs only `libssl-dev` and `uuid-dev` — at
+the cost of a much longer build. See *Self-contained build* below.
 
 ### Build
 
@@ -97,6 +133,23 @@ cmake --build . --parallel $(nproc)
 
 The build will also compile **omle-runtime** from the sibling directory
 `../omle-runtime` automatically.
+
+### Self-contained build
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOMLE_SERVER_BUNDLE_DEPS=ON
+cmake --build build --target omle_server
+```
+
+Compiles every dependency from pinned source and links them statically, which
+is how the published wheels are built. It takes considerably longer — gRPC and
+its submodules are built from scratch — and produces one ~25 MB executable that
+can be copied to a machine with nothing installed but a C++ runtime and
+OpenSSL. A default build links 112 shared libraries, 79 of them Abseil, and so
+only runs where all of them are present at matching versions.
+
+It is also the only way to build where no package manager supplies Drogon and
+gRPC, which is why CI uses it for Windows.
 
 ---
 

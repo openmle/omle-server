@@ -7,6 +7,10 @@ name = "omle-server"
 dynamic = ["version"]
 description = "OMLE inference server — OIP-compatible REST + gRPC serving"
 requires-python = ">=3.10"
+readme = "README.md"
+# No Python dependencies: the payload is a statically linked executable. Its one
+# runtime requirement, OpenSSL 3, is a system library that this field cannot
+# express — see README.md.
 dependencies = []
 
 [project.optional-dependencies]

@@ -44,3 +44,20 @@ build/
 build_tests/
 .cache
 /python/omle_server/_version.py
+
+# Python build output. setuptools regenerates the egg-info on every build, so a
+# tracked copy churns on each commit and the end-of-file-fixer hook rewrites it
+# in CI — which is what made the Style job fail. dist/ and wheelhouse/ hold
+# built and repaired wheels; those belong on an index, not in the repository.
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+/python/dist/
+/python/wheelhouse/
+
+# CMake's compile database. Generated per build tree and full of absolute
+# paths from whichever machine produced it, so a committed copy is wrong for
+# everyone else. Editors and clangd generate or find their own.
+compile_commands.json

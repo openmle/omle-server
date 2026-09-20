@@ -51,15 +51,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux and macOS use system packages: apt and brew both supply
+          # Drogon and gRPC, so these rows finish in minutes and exercise the
+          # unbundled path a developer following the README takes.
           - os: ubuntu-latest
             bundled: "OFF"
           - os: macos-latest
             bundled: "OFF"
-          # Windows has no apt/brew to supply Drogon, gRPC, jsoncpp or GTest,
-          # so it builds every dependency from source instead. That is far
-          # slower than the other two rows — it compiles gRPC and its
-          # submodules — but it is the only way to build here at all, and it
-          # exercises the same path the published wheels use.
+          # Windows has no package manager for Drogon or gRPC, so it builds
+          # every dependency from pinned source. That is slow — gRPC's
+          # submodules (Abseil, protobuf, BoringSSL, re2, c-ares) are a large
+          # git clone, and the clone dominates, not the compile — so the
+          # FetchContent cache below is what keeps this row tolerable after the
+          # first run. It is the same path the published wheels use.
           - os: windows-latest
             bundled: "ON"
 
@@ -86,13 +90,28 @@ jobs:
       # vendored, so they have to exist before configure. simdjson and
       # nlohmann/json fall back to FetchContent when absent (see
       # cmake/deps.cmake), but installing them keeps the build off the network.
+      #
+      # jsoncpp, uuid and zlib are listed explicitly because DrogonConfig.cmake
+      # calls find_dependency(... REQUIRED) on all three, and
+      # --no-install-recommends means libdrogon-dev does not drag them in.
+      # The long tail here is Drogon's, not ours. Ubuntu builds libdrogon-dev
+      # with ORM support, so DrogonConfig.cmake calls find_dependency on
+      # PostgreSQL, SQLite, MySQL, Boost, Hiredis and yaml-cpp — every one of
+      # which must resolve before find_package(Drogon) reports success, even
+      # though this server touches no database. They fail one at a time, and
+      # each failure surfaces as a bare "Drogon not found".
+      #
+      # libmariadb-dev-compat is the non-obvious one: Drogon's FindMySQL wants
+      # the mysql_config script, which default-libmysqlclient-dev does not ship.
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build \
-            libdrogon-dev \
+            libdrogon-dev libjsoncpp-dev uuid-dev zlib1g-dev \
+            libpq-dev libsqlite3-dev libmariadb-dev libmariadb-dev-compat \
+            libhiredis-dev libyaml-cpp-dev libboost-dev libbrotli-dev \
             libgrpc++-dev protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
             libgtest-dev \
             libsimdjson-dev nlohmann-json3-dev
@@ -101,8 +120,43 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install cmake ninja drogon grpc protobuf googletest simdjson nlohmann-json
 
-      # Nothing to install on Windows: cmake and ninja ship with the runner
-      # image, and every library comes from cmake/bundled_deps.cmake.
+      # Everything except OpenSSL comes from cmake/bundled_deps.cmake. OpenSSL
+      # is required rather than optional now that gRPC uses SSL_PROVIDER=package
+      # — both it and trantor link it — and CMake will not find it unaided on
+      # Windows, which is what "Trantor using SSL library: None" meant in an
+      # earlier run.
+      #
+      # It must be the MSVC build. The runner also carries Strawberry Perl,
+      # whose OpenSSL is MinGW-built and cannot be linked into MSVC objects, so
+      # the search below deliberately skips C:/Strawberry.
+      - name: Locate OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          for d in "/c/Program Files/OpenSSL-Win64" "/c/Program Files/OpenSSL" \
+                   "/c/Program Files/OpenSSL-Win64-3" ; do
+            if [ -f "$d/include/openssl/ssl.h" ]; then
+              echo "OPENSSL_ROOT_DIR=$(cygpath -w "$d")" >> "$GITHUB_ENV"
+              echo "found OpenSSL at $d"
+              exit 0
+            fi
+          done
+          echo "::error::no MSVC OpenSSL on this runner. Install one (choco"
+          echo "install openssl) or set OPENSSL_ROOT_DIR; gRPC and trantor both"
+          echo "require it and the build cannot proceed without TLS support."
+          exit 1
+
+
+      # Caches the FetchContent downloads, which is what makes the bundled row
+      # bearable: the cost there is cloning gRPC's submodules, not compiling
+      # them. Keyed on bundled_deps.cmake, so bumping any pin in that file
+      # invalidates it and nothing else does.
+      - name: Cache fetched dependency sources
+        if: matrix.bundled == 'ON'
+        uses: actions/cache@v4
+        with:
+          path: omle-server/build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('omle-server/cmake/bundled_deps.cmake') }}
 
       - name: Configure
         working-directory: omle-server
@@ -111,7 +165,21 @@ jobs:
         # build without this; a run that forgot it would look green having
         # compiled no test at all.
         run: |
-          cmake -S . -B build -G Ninja \
+          # No -G on Windows. CMake then defaults to the Visual Studio
+          # generator and builds with MSVC, which is what omle-runtime's
+          # Windows wheels and jar are built with. Forcing -G Ninja instead
+          # picks up whatever compiler is first on PATH — on the runner image
+          # that is MinGW GCC, giving a binary with a different C++ runtime
+          # than every other Windows artifact in the project.
+          #
+          # Visual Studio is a multi-config generator, so the build and test
+          # steps pass --config / --build-config rather than relying on
+          # CMAKE_BUILD_TYPE.
+          GEN="-G Ninja"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GEN=""
+          fi
+          cmake -S . -B build $GEN \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SERVER_TESTS=ON \
             -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
@@ -121,7 +189,9 @@ jobs:
         shell: bash
         # The default target, not just omle_server: the test executables are
         # separate targets and `--target omle_server` would skip them.
-        run: cmake --build build -j 4
+        # --config is required by the Visual Studio generator and ignored by
+        # Ninja, so one line serves both.
+        run: cmake --build build --config Release -j 4
 
       - name: Assert the binary landed where the tests look for it
         working-directory: omle-server
@@ -130,20 +200,31 @@ jobs:
         # without this check a build that produced nothing would report a green
         # run with every integration test silently skipped.
         run: |
+          # Both layouts are checked because both occur: Ninja writes to
+          # build/, while the Visual Studio generator is multi-config and
+          # writes to build/Release/. conftest.py searches the same pair.
+          #
           # if/fi rather than `[ ... ] && BIN=...`: the runner runs bash with
           # `set -e`, so a false test at the end of an && chain would exit
           # non-zero and fail this step on every non-Windows row.
           if [ "$RUNNER_OS" = "Windows" ]; then
-            BIN=build/omle_server.exe
+            NAME=omle_server.exe
           else
-            BIN=build/omle_server
+            NAME=omle_server
           fi
-          test -f "$BIN" || { echo "::error::$BIN missing"; exit 1; }
-          echo "$BIN present"
+          FOUND=""
+          for c in "build/$NAME" "build/Release/$NAME"; do
+            if [ -f "$c" ]; then FOUND="$c"; break; fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::no $NAME in build/ or build/Release/"
+            exit 1
+          fi
+          echo "$FOUND present"
 
       - name: C++ unit tests
         working-directory: omle-server/build
-        run: ctest --output-on-failure
+        run: ctest --output-on-failure --build-config Release
 
       - name: Install the Python test dependencies
         working-directory: omle-server/python
