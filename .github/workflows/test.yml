@@ -1,0 +1,159 @@
+name: Tests
+
+# omle-server is the top of the stack: it compiles omle-runtime as a CMake
+# subproject, and omle-runtime in turn reads omle.proto out of the `omle`
+# repository. So every build job checks out all three as siblings —
+# CMakeLists.txt resolves OMLE_RUNTIME_DIR as ../omle-runtime, and the Python
+# integration tests resolve their fixture models relative to the same layout
+# (python/tests/conftest.py walks four levels up to the workspace root).
+#
+# The C++ unit tests and the Python integration tests share one build: the
+# configure step pulls in gRPC codegen, Drogon and the whole runtime, which is
+# the expensive part, and splitting them into separate jobs would pay it twice.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Style — runs .pre-commit-config.yaml, the same file the local git hook runs,
+  # so the two cannot drift. Seconds, and it fails before the build has finished
+  # installing a toolchain.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+      - run: pip install pre-commit
+      # --show-diff-on-failure prints the patch the autofixing hooks would have
+      # applied, so a red build hands back the fix rather than just a rule name.
+      - run: pre-commit run --all-files --show-diff-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Build, then the C++ unit tests and the Python REST/gRPC integration tests.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bundled: "OFF"
+          - os: macos-latest
+            bundled: "OFF"
+          # Windows has no apt/brew to supply Drogon, gRPC, jsoncpp or GTest,
+          # so it builds every dependency from source instead. That is far
+          # slower than the other two rows — it compiles gRPC and its
+          # submodules — but it is the only way to build here at all, and it
+          # exercises the same path the published wheels use.
+          - os: windows-latest
+            bundled: "ON"
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          path: omle-server
+      - uses: actions/checkout@v4.2.2
+        with:
+          repository: openmle/omle-runtime
+          path: omle-runtime
+      # omle-runtime's CMakeLists generates omle.pb.cc from this repository's
+      # schema, so it is needed even though nothing here is Python.
+      - uses: actions/checkout@v4.2.2
+        with:
+          repository: openmle/omle
+          path: omle
+
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: "3.12"
+
+      # Drogon, gRPC, protobuf and GTest are found with find_package and are not
+      # vendored, so they have to exist before configure. simdjson and
+      # nlohmann/json fall back to FetchContent when absent (see
+      # cmake/deps.cmake), but installing them keeps the build off the network.
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build \
+            libdrogon-dev \
+            libgrpc++-dev protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
+            libgtest-dev \
+            libsimdjson-dev nlohmann-json3-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja drogon grpc protobuf googletest simdjson nlohmann-json
+
+      # Nothing to install on Windows: cmake and ninja ship with the runner
+      # image, and every library comes from cmake/bundled_deps.cmake.
+
+      - name: Configure
+        working-directory: omle-server
+        shell: bash
+        # BUILD_SERVER_TESTS defaults OFF, so tests/ is not even added to the
+        # build without this; a run that forgot it would look green having
+        # compiled no test at all.
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SERVER_TESTS=ON \
+            -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
+
+      - name: Build
+        working-directory: omle-server
+        shell: bash
+        # The default target, not just omle_server: the test executables are
+        # separate targets and `--target omle_server` would skip them.
+        run: cmake --build build -j 4
+
+      - name: Assert the binary landed where the tests look for it
+        working-directory: omle-server
+        shell: bash
+        # python/tests/conftest.py SKIPS when it cannot find the binary, so
+        # without this check a build that produced nothing would report a green
+        # run with every integration test silently skipped.
+        run: |
+          # if/fi rather than `[ ... ] && BIN=...`: the runner runs bash with
+          # `set -e`, so a false test at the end of an && chain would exit
+          # non-zero and fail this step on every non-Windows row.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN=build/omle_server.exe
+          else
+            BIN=build/omle_server
+          fi
+          test -f "$BIN" || { echo "::error::$BIN missing"; exit 1; }
+          echo "$BIN present"
+
+      - name: C++ unit tests
+        working-directory: omle-server/build
+        run: ctest --output-on-failure
+
+      - name: Install the Python test dependencies
+        working-directory: omle-server/python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: REST and gRPC integration tests
+        working-directory: omle-server/python
+        # These start build/omle_server once per session and drive it over both
+        # protocols, so they are the only check that the two OIP surfaces agree
+        # with each other and with the runtime.
+        run: pytest -q

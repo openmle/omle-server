@@ -1,0 +1,217 @@
+name: Publish omle-server
+
+# Publishes omle-server to PyPI as one platform-tagged wheel per platform.
+#
+# The package ships a compiled executable, not a Python extension, which shapes
+# the whole workflow:
+#
+#   * One wheel per PLATFORM, not per interpreter. omle-runtime needs
+#     cp310…cp314 wheels because its extension is imported and bound to the
+#     CPython ABI; omle_server is exec'd by a console script, so `py3-none-<plat>`
+#     serves every supported Python. Three wheels here versus twenty there.
+#
+#   * Every wheel is built with OMLE_SERVER_BUNDLE_DEPS=ON. Without it the
+#     binary needs gRPC, Abseil, protobuf and Drogon installed at matching
+#     versions — 112 shared libraries — which is not something a `pip install`
+#     can arrange. The bundled build links all of them statically and leaves
+#     only OpenSSL, jsoncpp and system libraries external.
+#
+#   * Linux wheels are built inside the manylinux_2_28 image. A wheel built on
+#     the bare runner would be tagged for that runner's glibc (2.39 on
+#     ubuntu-latest), which PyPI rejects and almost no deployment target
+#     matches. This is the same baseline omle-runtime's wheels use.
+#
+# Platforms match omle-runtime's wheel matrix apart from Windows: the code
+# anticipates it (MSVC flags, omle_server.exe) but cmake/deps.cmake documents
+# only Homebrew and apt, and nobody has built it there. Adding a windows row
+# before that is verified would only produce a red release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      index:
+        description: "Index to publish to"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. One self-contained wheel per platform.
+  # ---------------------------------------------------------------------------
+  wheels:
+    name: Wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            container: quay.io/pypa/manylinux_2_28_x86_64
+          # Free arm64 Linux runners are public-repository only; drop this row
+          # if that does not apply, at the cost of aarch64 wheels.
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+            container: quay.io/pypa/manylinux_2_28_aarch64
+          # Apple silicon only, matching omle-runtime. An Intel Mac builds from
+          # source.
+          - os: macos-latest
+            target: macos-arm64
+            container: ""
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          path: omle-server
+          # setuptools-scm derives the version from tags; a shallow clone gives
+          # a 0.1.dev1+g<sha> that PyPI will not accept.
+          fetch-depth: 0
+      - uses: actions/checkout@v4.2.2
+        with:
+          repository: openmle/omle-runtime
+          path: omle-runtime
+      # omle-runtime generates omle.pb.cc from this repository's schema.
+      - uses: actions/checkout@v4.2.2
+        with:
+          repository: openmle/omle
+          path: omle
+
+      # Only the toolchain and the two libraries the bundled build still links
+      # externally. gRPC, Abseil, protobuf, Drogon and simdjson are compiled
+      # from pinned source by cmake/bundled_deps.cmake and must NOT be
+      # installed here — a system copy is exactly what that file exists to
+      # avoid.
+      - name: Install the toolchain (manylinux)
+        if: runner.os == 'Linux'
+        run: |
+          dnf install -y cmake ninja-build git openssl-devel jsoncpp-devel
+
+      - name: Install the toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja jsoncpp openssl@3
+
+      - uses: actions/setup-python@v5.6.0
+        if: runner.os == 'macOS'
+        with:
+          python-version: "3.12"
+
+      - name: Build the self-contained binary
+        working-directory: omle-server
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOMLE_SERVER_BUNDLE_DEPS=ON
+          cmake --build build --target omle_server -j 4
+
+      - name: Assert it links nothing it should have absorbed
+        working-directory: omle-server
+        shell: bash
+        # A binary that still names gRPC, Abseil, protobuf or Drogon means the
+        # bundled build silently fell back to a system copy. Such a wheel
+        # installs and imports fine and only fails on a machine without those
+        # libraries, so this is checked before it can reach an index.
+        run: |
+          BIN=build/omle_server
+          case "$RUNNER_OS" in
+            Linux) LEAKED=$(ldd "$BIN" | grep -ciE 'grpc|absl|protobuf|drogon|trantor|simdjson|omleruntime' || true) ;;
+            macOS) LEAKED=$(otool -L "$BIN" | grep -ciE 'grpc|absl|protobuf|drogon|trantor|simdjson|omleruntime' || true) ;;
+          esac
+          if [ "$LEAKED" -ne 0 ]; then
+            echo "::error::$BIN links $LEAKED libraries the bundled build should"
+            echo "have absorbed. cmake/bundled_deps.cmake found a system copy."
+            exit 1
+          fi
+          echo "$BIN absorbed its dependencies"
+
+      - name: Stage the binary into the package and build the wheel
+        working-directory: omle-server
+        shell: bash
+        # Copied explicitly rather than via scripts/build.py: that script runs
+        # its own cmake configure against build/, so whether it produced a
+        # bundled binary would depend on the cache written by the step above
+        # rather than on anything stated here. python/omle_server/bin/ is what
+        # package-data ships.
+        run: |
+          python3 -m pip install --upgrade pip build
+          mkdir -p python/omle_server/bin
+          cp build/omle_server python/omle_server/bin/
+          chmod 755 python/omle_server/bin/omle_server
+          cd python && python3 -m build --wheel
+
+      # Vendors the remaining external libraries (OpenSSL, jsoncpp) into the
+      # wheel and rewrites the binary's load paths, and on Linux retags the
+      # wheel to the manylinux baseline PyPI accepts.
+      - name: Repair the wheel (Linux)
+        if: runner.os == 'Linux'
+        working-directory: omle-server/python
+        run: |
+          python3 -m pip install auditwheel
+          auditwheel repair dist/*.whl -w wheelhouse/ --plat manylinux_2_28_${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+
+      - name: Repair the wheel (macOS)
+        if: runner.os == 'macOS'
+        working-directory: omle-server/python
+        run: |
+          python3 -m pip install delocate
+          delocate-wheel -w wheelhouse/ -v dist/*.whl
+
+      - name: Show what shipped
+        working-directory: omle-server/python
+        shell: bash
+        # The binary is the entire payload; a wheel that built cleanly without
+        # it would install and then fail at first use.
+        run: |
+          ls -la wheelhouse/
+          for whl in wheelhouse/*.whl; do
+            echo "=== $whl"
+            python3 - "$whl" <<'PY'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          binaries = [n for n in names if "/bin/omle_server" in n]
+          for n in sorted(names):
+              print(f"  {n}")
+          if not binaries:
+              sys.exit("::error::wheel contains no omle_server binary")
+          PY
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-omle-server-${{ matrix.target }}
+          path: omle-server/python/wheelhouse/*.whl
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 2. Publish.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to ${{ github.event_name == 'push' && 'pypi' || inputs.index }}
+    needs: wheels
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'push' && 'pypi' || inputs.index }}
+    permissions:
+      # Trusted Publishing: a short-lived OIDC token rather than a long-lived
+      # API token in secrets. Configure the publisher once at
+      # https://pypi.org/manage/project/omle-server/settings/publishing/
+      # naming this repository, publish.yml, and the environment above.
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-omle-server-*
+          path: dist
+          merge-multiple: true
+
+      - run: ls -la dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ (github.event_name == 'workflow_dispatch' && inputs.index == 'testpypi') && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}

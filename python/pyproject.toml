@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools-scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omle-server"
+dynamic = ["version"]
+description = "OMLE inference server — OIP-compatible REST + gRPC serving"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "requests", "grpcio", "grpcio-tools"]
+
+[project.scripts]
+omle-server = "omle_server._cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["omle_server*"]
+
+[tool.setuptools.package-data]
+omle_server = ["bin/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools_scm]
+# The package lives in python/ inside the repo; point setuptools-scm at the
+# git root one level up, or it cannot detect a version from this subdirectory.
+root = ".."
+version_file = "omle_server/_version.py"

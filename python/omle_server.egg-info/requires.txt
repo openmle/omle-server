@@ -1,0 +1,6 @@
+
+[dev]
+pytest
+requests
+grpcio
+grpcio-tools
