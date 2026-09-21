@@ -1,4 +1,4 @@
-# omle-server
+# OMLE Server
 
 High-performance C++ inference server for OMLE models.  Implements the
 [Open Inference Protocol](https://github.com/kserve/open-inference-protocol)
