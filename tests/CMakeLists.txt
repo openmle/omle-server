@@ -76,8 +76,22 @@ set(SERVER_BINARY_FOR_TESTS "${CMAKE_BINARY_DIR}/omle_server"
     CACHE FILEPATH "omle_server binary used by the integration test")
 
 # Path to the 2-feature test model copied into the temp model directory.
+#
+# Vendored in this repository rather than read out of a sibling checkout. It
+# used to point at ../omle-runtime/spark/src/test/resources/, which broke when
+# the Spark bindings moved to their own repository: the path simply stopped
+# existing, the integration test skipped the copy without saying so, and the
+# server came up against an empty model directory. Every model-dependent test
+# then failed with 503 while the health checks passed, which points nowhere
+# near a missing file.
+#
+# omle-server depends on omle-runtime's library, not on its test fixtures, so
+# reaching into them coupled this repository to another's internal layout. The
+# file is 190 bytes; omle-runtime and omle-spark each keep their own copy for
+# the same reason. They were produced by one script and are byte-identical, so
+# a change to the model has to be mirrored across all three deliberately.
 set(TEST_MODEL_SRC
-    "${CMAKE_SOURCE_DIR}/../omle-runtime/spark/src/test/resources/test_model_2f.omle"
+    "${CMAKE_CURRENT_SOURCE_DIR}/data/test_model_2f.omle"
     CACHE FILEPATH "Test model source for integration tests")
 
 # Integration test has its own main() (uses AddGlobalTestEnvironment).
