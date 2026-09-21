@@ -94,22 +94,43 @@ set(TEST_MODEL_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/data/test_model_2f.omle"
     CACHE FILEPATH "Test model source for integration tests")
 
-# Integration test has its own main() (uses AddGlobalTestEnvironment).
-add_executable(test_server_integration test_server_integration.cpp)
-target_include_directories(test_server_integration PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/../include"
-  "${CMAKE_CURRENT_BINARY_DIR}/../grpc_gen"
-)
-target_link_libraries(test_server_integration PRIVATE
-  GTest::GTest gRPC::grpc++ oip_proto nlohmann_json::nlohmann_json)
-target_compile_options(test_server_integration PRIVATE
-    $<$<CXX_COMPILER_ID:MSVC>:/W3>
-    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra;-Wno-unused-parameter>)
-target_compile_definitions(test_server_integration PRIVATE
-  SERVER_BINARY_PATH="${SERVER_BINARY_FOR_TESTS}"
-  TEST_MODEL_SRC_PATH="${TEST_MODEL_SRC}")
+# Integration test — POSIX only.
+#
+# It starts the server with fork() + execl(), reaps it with waitpid() and
+# kill(), and drives REST over raw <sys/socket.h> calls. fork/exec in
+# particular has no Windows equivalent, so this is a harness rewrite rather
+# than an include fix, and MSVC stops at the first missing header:
+#
+#   error C1083: Cannot open include file: 'arpa/inet.h'
+#
+# Nothing is lost by skipping it there. python/tests/ drives the same server
+# over the same two protocols using subprocess and requests, both portable,
+# and covers every case this file does — all 17 GrpcTest cases and all 21 REST
+# cases have a one-to-one counterpart, plus one more. That suite is already
+# Windows-aware: conftest.py looks for omle_server.exe and the multi-config
+# build/Release/ layout. test_oip_codec and test_metrics above are pure unit
+# tests and still build and run on Windows.
+if(WIN32)
+  message(STATUS "test_server_integration: skipped on Windows (POSIX fork/exec "
+                 "and sockets); python/tests covers the same surface")
+else()
+  # Integration test has its own main() (uses AddGlobalTestEnvironment).
+  add_executable(test_server_integration test_server_integration.cpp)
+  target_include_directories(test_server_integration PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_BINARY_DIR}/../grpc_gen"
+  )
+  target_link_libraries(test_server_integration PRIVATE
+    GTest::GTest gRPC::grpc++ oip_proto nlohmann_json::nlohmann_json)
+  target_compile_options(test_server_integration PRIVATE
+      $<$<CXX_COMPILER_ID:MSVC>:/W3>
+      $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra;-Wno-unused-parameter>)
+  target_compile_definitions(test_server_integration PRIVATE
+    SERVER_BINARY_PATH="${SERVER_BINARY_FOR_TESTS}"
+    TEST_MODEL_SRC_PATH="${TEST_MODEL_SRC}")
 
-# Ensure the server binary is built before the integration test runs.
-add_dependencies(test_server_integration omle_server)
+  # Ensure the server binary is built before the integration test runs.
+  add_dependencies(test_server_integration omle_server)
 
-add_test(NAME test_server_integration COMMAND test_server_integration)
+  add_test(NAME test_server_integration COMMAND test_server_integration)
+endif()
