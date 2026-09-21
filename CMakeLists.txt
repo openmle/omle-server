@@ -9,6 +9,26 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Any translation unit that pulls in <windows.h> gets min and max as
+# function-like macros unless NOMINMAX is set. gRPC's headers are what surface
+# this: grpc/event_engine/memory_request.h declares
+#
+#     size_t min() const { return min_; }
+#
+# and `min()` with no arguments does not expand, so MSVC reports
+# "C2059: syntax error: ')'" inside a gRPC header that is perfectly valid.
+# The parse then derails mid-namespace and grpc_event_engine is never closed,
+# so every later include lands inside it — which is why the follow-on errors
+# name types like grpc_event_engine::absl::lts_20260107::Status and look like
+# an Abseil problem rather than a preprocessor one.
+#
+# Set before add_subdirectory below so the tests inherit it too. omle-runtime's
+# CMakeLists sets the same pair for its own targets; directory scope does not
+# carry upward, so this is not redundant.
+if(MSVC)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # -march=native is deliberately absent: it bakes the build machine's ISA into
 # the binary, so a server image built on one host can fault on another. There is
 # no hand-written SIMD in this project to keep alive either -- the intrinsics
