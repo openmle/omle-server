@@ -132,7 +132,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.conan2/p
-          key: conan-${{ runner.os }}-${{ hashFiles('omle-server/conanfile.txt') }}
+          key: conan-${{ runner.os }}-${{ hashFiles('omle-server/conanfile.txt', 'omle-server/conan/profiles/windows-msvc') }}
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
@@ -140,23 +140,24 @@ jobs:
         shell: bash
         run: |
           pip install conan
-          conan profile detect --force
 
-          # cppstd and runtime are passed explicitly, not left to `profile
-          # detect`, which picks cppstd=14 for msvc. ConanCenter's binaries are
-          # built at cppstd=17 with the dynamic runtime, and a package_id that
-          # misses them is not an error — Conan just builds from source, which
-          # is the slow path this job exists to avoid.
+          # -pr:a, not `conan profile detect`, and not -s flags.
           #
-          # --build=never makes that failure loud instead: if a binary is ever
-          # absent, this step fails in seconds naming the package, rather than
-          # going green forty minutes later.
+          # :a applies the profile to the host *and* build contexts. Settings
+          # given as -s reach only the host, so [tool_requires] kept detect's
+          # cppstd=14 and protobuf and gRPC — which require 17 — were rejected
+          # outright: "Invalid: Current cppstd (14) is lower than the required
+          # C++ standard (17)". The host context failed more quietly, with
+          # every package "Missing", because a detected profile that differs in
+          # any setting yields package_ids nothing was ever built for.
+          #
+          # --build=never keeps that loud. A missing binary fails here in
+          # seconds naming the package, instead of silently falling back to
+          # building gRPC from source and going green forty minutes later.
           conan install . \
             --output-folder=build/conan \
             --build=never \
-            -s build_type=Release \
-            -s compiler.cppstd=17 \
-            -s compiler.runtime=dynamic
+            -pr:a=conan/profiles/windows-msvc
 
       # Caches the FetchContent downloads, which is what makes the bundled row
       # bearable: the cost there is cloning gRPC's submodules, not compiling
