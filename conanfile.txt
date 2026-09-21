@@ -1,0 +1,48 @@
+# Conan dependency set, used only by the Windows CI job.
+#
+# Linux and macOS install Drogon and gRPC from apt and brew; Windows has
+# neither, and building gRPC from source there means cloning Abseil, protobuf,
+# BoringSSL, re2 and c-ares and compiling the lot. ConanCenter publishes
+# prebuilt binaries for msvc, so that row downloads instead of builds.
+#
+# This changes nothing about how the project is built: cmake/deps.cmake already
+# locates everything through find_package(... CONFIG), and Conan's CMakeDeps
+# generator emits exactly those package config files. Windows therefore takes
+# the same unbundled code path as the other two platforms.
+#
+# Every version here is pinned to one ConanCenter publishes a msvc binary for,
+# which is narrower than "a version that exists". Recipes are indexed for far
+# more configurations than are actually built, and a pin without a binary is
+# not an error — Conan just builds it from source, which is the slow path this
+# whole file exists to avoid. These were each checked with:
+#
+#   conan graph info . -pr:h=<msvc profile> -pr:b=<msvc profile>
+#
+# and any pin reported under "Missing packages" was moved until it resolved.
+# drogon 1.9.12 (the bundled pin) and gtest 1.16.0 both had to move for this
+# reason; simdjson and nlohmann_json match bundled_deps.cmake exactly, and gRPC
+# is 1.83.1 against a bundled v1.84.0, which ConanCenter does not carry.
+
+[requires]
+grpc/1.83.1
+drogon/1.9.13
+simdjson/3.10.1
+nlohmann_json/3.11.3
+gtest/1.17.0
+
+# grpc_cpp_plugin and protoc are executables the build runs, not libraries it
+# links. VirtualBuildEnv puts their directory on PATH, which is where
+# cmake/deps.cmake's find_program looks.
+[tool_requires]
+grpc/1.83.1
+protobuf/<host_version>
+
+[generators]
+CMakeDeps
+CMakeToolchain
+VirtualBuildEnv
+
+[options]
+# A self-contained omle_server.exe, matching BUILD_SHARED_LIBS=OFF on the
+# bundled path.
+*:shared=False

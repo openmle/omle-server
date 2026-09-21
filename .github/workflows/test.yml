@@ -58,14 +58,15 @@ jobs:
             bundled: "OFF"
           - os: macos-latest
             bundled: "OFF"
-          # Windows has no package manager for Drogon or gRPC, so it builds
-          # every dependency from pinned source. That is slow — gRPC's
-          # submodules (Abseil, protobuf, BoringSSL, re2, c-ares) are a large
-          # git clone, and the clone dominates, not the compile — so the
-          # FetchContent cache below is what keeps this row tolerable after the
-          # first run. It is the same path the published wheels use.
+          # Windows has no apt or brew, but ConanCenter publishes prebuilt
+          # msvc binaries for every dependency here — including OpenSSL — so
+          # this row downloads them rather than compiling gRPC's submodule tree
+          # (Abseil, protobuf, BoringSSL, re2, c-ares) from source. Conan's
+          # CMakeDeps generator emits ordinary package config files, so this is
+          # the same unbundled find_package path Linux and macOS take; nothing
+          # in cmake/ is Conan-aware.
           - os: windows-latest
-            bundled: "ON"
+            bundled: "OFF"
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -120,32 +121,42 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install cmake ninja drogon grpc protobuf googletest simdjson nlohmann-json
 
-      # Everything except OpenSSL comes from cmake/bundled_deps.cmake. OpenSSL
-      # is required rather than optional now that gRPC uses SSL_PROVIDER=package
-      # — both it and trantor link it — and CMake will not find it unaided on
-      # Windows, which is what "Trantor using SSL library: None" meant in an
-      # earlier run.
-      #
-      # It must be the MSVC build. The runner also carries Strawberry Perl,
-      # whose OpenSSL is MinGW-built and cannot be linked into MSVC objects, so
-      # the search below deliberately skips C:/Strawberry.
-      - name: Locate OpenSSL (Windows)
+      # Conan supplies Drogon, gRPC, protobuf, OpenSSL, GTest, simdjson and
+      # nlohmann/json as prebuilt msvc binaries. This also retires the previous
+      # hunt for an MSVC OpenSSL on the runner: the bundled build needed one
+      # because gRPC uses SSL_PROVIDER=package and trantor links it too, and
+      # the runner's only other copy is Strawberry Perl's MinGW build, which
+      # cannot be linked into MSVC objects.
+      - name: Cache the Conan package cache
         if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ runner.os }}-${{ hashFiles('omle-server/conanfile.txt') }}
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        working-directory: omle-server
         shell: bash
         run: |
-          for d in "/c/Program Files/OpenSSL-Win64" "/c/Program Files/OpenSSL" \
-                   "/c/Program Files/OpenSSL-Win64-3" ; do
-            if [ -f "$d/include/openssl/ssl.h" ]; then
-              echo "OPENSSL_ROOT_DIR=$(cygpath -w "$d")" >> "$GITHUB_ENV"
-              echo "found OpenSSL at $d"
-              exit 0
-            fi
-          done
-          echo "::error::no MSVC OpenSSL on this runner. Install one (choco"
-          echo "install openssl) or set OPENSSL_ROOT_DIR; gRPC and trantor both"
-          echo "require it and the build cannot proceed without TLS support."
-          exit 1
+          pip install conan
+          conan profile detect --force
 
+          # cppstd and runtime are passed explicitly, not left to `profile
+          # detect`, which picks cppstd=14 for msvc. ConanCenter's binaries are
+          # built at cppstd=17 with the dynamic runtime, and a package_id that
+          # misses them is not an error — Conan just builds from source, which
+          # is the slow path this job exists to avoid.
+          #
+          # --build=never makes that failure loud instead: if a binary is ever
+          # absent, this step fails in seconds naming the package, rather than
+          # going green forty minutes later.
+          conan install . \
+            --output-folder=build/conan \
+            --build=never \
+            -s build_type=Release \
+            -s compiler.cppstd=17 \
+            -s compiler.runtime=dynamic
 
       # Caches the FetchContent downloads, which is what makes the bundled row
       # bearable: the cost there is cloning gRPC's submodules, not compiling
@@ -176,10 +187,17 @@ jobs:
           # steps pass --config / --build-config rather than relying on
           # CMAKE_BUILD_TYPE.
           GEN="-G Ninja"
+          EXTRA=""
           if [ "$RUNNER_OS" = "Windows" ]; then
             GEN=""
+            # CMP0091 NEW is what lets the toolchain set the MSVC runtime
+            # through CMAKE_MSVC_RUNTIME_LIBRARY; without it the flag is baked
+            # into CMAKE_CXX_FLAGS instead and Conan's setting is ignored,
+            # giving a runtime mismatch against the downloaded binaries.
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
+            EXTRA="$EXTRA -DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
           fi
-          cmake -S . -B build $GEN \
+          cmake -S . -B build $GEN $EXTRA \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SERVER_TESTS=ON \
             -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}

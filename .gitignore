@@ -61,3 +61,6 @@ __pycache__/
 # paths from whichever machine produced it, so a committed copy is wrong for
 # everyone else. Editors and clangd generate or find their own.
 compile_commands.json
+
+# Written by `conan install` (absolute paths, per-machine).
+/CMakeUserPresets.json

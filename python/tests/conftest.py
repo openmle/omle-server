@@ -20,7 +20,6 @@ import requests
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
-_REPO_ROOT = pathlib.Path(__file__).parent.parent.parent.parent  # open-ml-exchange/
 # MSVC appends .exe, and a multi-config generator puts the binary under
 # build/<Config>/ rather than build/. Both spellings are searched so the same
 # tests run everywhere; without this the Windows job would find nothing and
@@ -41,15 +40,21 @@ _SERVER_BIN = next(
     _BUILD_DIR / _BIN_NAME,  # reported in the skip message when none exist
 )
 
-# A ready-made test model (2 FP64 features → 1 FP32 score).
-_TEST_MODEL_SRC = (
-    _REPO_ROOT / "omle-runtime" / "spark" / "src" / "test" / "resources" / "test_model_2f.omle"
-)
+# Test models, vendored in this repository under tests/data/.
+#
+# These used to be read from a sibling omle-runtime checkout, under spark/,
+# which stopped existing when the Spark bindings moved to their own repository.
+# The copy below was conditional, so the models were skipped in silence and the
+# server started against an empty directory: health checks passed while every
+# model-dependent test failed with 404/503, naming nothing that was missing.
+# The C++ integration test had the identical defect.
+_DATA_DIR = pathlib.Path(__file__).parent.parent.parent / "tests" / "data"
+
+# 2 FP64 features → 1 FP32 score.
+_TEST_MODEL_SRC = _DATA_DIR / "test_model_2f.omle"
 
 # 3-class probability model (2 features → 3-class softmax).
-_TEST_MODEL_3CLASS_SRC = (
-    _REPO_ROOT / "omle-runtime" / "spark" / "src" / "test" / "resources" / "test_model_3class.omle"
-)
+_TEST_MODEL_3CLASS_SRC = _DATA_DIR / "test_model_3class.omle"
 
 REST_PORT = 18080
 GRPC_PORT = 18081
@@ -76,10 +81,17 @@ def _wait_ready(url: str, timeout: float = 20.0) -> None:
 @pytest.fixture(scope="session")
 def model_dir(tmp_path_factory):
     d = tmp_path_factory.mktemp("models")
-    if _TEST_MODEL_SRC.exists():
-        shutil.copy(_TEST_MODEL_SRC, d / "test_model_2f.omle")
-    if _TEST_MODEL_3CLASS_SRC.exists():
-        shutil.copy(_TEST_MODEL_3CLASS_SRC, d / "test_model_3class.omle")
+    # Fail, do not skip: without these the server still answers /v2/health/*,
+    # so a missing file surfaced as 24 failures with 404s and 503s instead.
+    missing = [p for p in (_TEST_MODEL_SRC, _TEST_MODEL_3CLASS_SRC) if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "test models not found: "
+            + ", ".join(str(p) for p in missing)
+            + " — every model-dependent test fails with 404/503 without them"
+        )
+    shutil.copy(_TEST_MODEL_SRC, d / "test_model_2f.omle")
+    shutil.copy(_TEST_MODEL_3CLASS_SRC, d / "test_model_3class.omle")
     return d
 
 
