@@ -10,11 +10,12 @@ name: Publish omle-server
 #     CPython ABI; omle_server is exec'd by a console script, so `py3-none-<plat>`
 #     serves every supported Python. Three wheels here versus twenty there.
 #
-#   * Every wheel is built with OMLE_SERVER_BUNDLE_DEPS=ON. Without it the
-#     binary needs gRPC, Abseil, protobuf and Drogon installed at matching
-#     versions — 112 shared libraries — which is not something a `pip install`
-#     can arrange. The bundled build links all of them statically and leaves
-#     only OpenSSL and system libraries external.
+#   * The Linux and macOS wheels are built with OMLE_SERVER_BUNDLE_DEPS=ON.
+#     Without it the binary needs gRPC, Abseil, protobuf and Drogon installed
+#     at matching versions — 112 shared libraries — which is not something a
+#     `pip install` can arrange. The bundled build links all of them statically
+#     and leaves only OpenSSL and system libraries external. Windows reaches
+#     the same end by a different route; see the note below.
 #
 #   * OpenSSL is deliberately NOT vendored into the wheel. A bundled libssl
 #     stops receiving the distribution's security updates and can only be
@@ -28,10 +29,18 @@ name: Publish omle-server
 #     ubuntu-latest), which PyPI rejects and almost no deployment target
 #     matches. This is the same baseline omle-runtime's wheels use.
 #
-# Platforms match omle-runtime's wheel matrix apart from Windows: the code
-# anticipates it (MSVC flags, omle_server.exe) but cmake/deps.cmake documents
-# only Homebrew and apt, and nobody has built it there. Adding a windows row
-# before that is verified would only produce a red release.
+# Platforms match omle-runtime's wheel matrix, Windows included. Windows is the
+# one row that does NOT use OMLE_SERVER_BUNDLE_DEPS=ON: it takes its
+# dependencies from ConanCenter as prebuilt msvc binaries, statically linked,
+# which produces the same self-contained executable without compiling gRPC's
+# submodule tree. See conanfile.txt and conan/profiles/windows-msvc.
+#
+# That row also departs from the OpenSSL rule above, unavoidably. Linux and
+# macOS have a system OpenSSL to link against; Windows does not, so the Conan
+# profile links it statically and the Windows wheel does carry a crypto
+# library frozen at build time. Patching it there means cutting a release. The
+# alternative — making every Windows user install OpenSSL themselves — is
+# worse, but the tradeoff is real and belongs in the release notes.
 
 on:
   workflow_dispatch:
@@ -46,6 +55,18 @@ on:
 
 permissions:
   contents: read
+
+# The sibling repositories are pinned, not taken from their default branches.
+# A release built against a moving dependency is not reproducible: rebuilding
+# this same tag later could link a different omle-runtime and produce a
+# different binary under an identical version number. test.yml deliberately
+# stays on the default branches — catching a sibling's breaking change early is
+# the point there — but a published artifact has to name what went into it.
+#
+# Bump these when omle-runtime or omle cuts a release that this one needs.
+env:
+  OMLE_RUNTIME_REF: v0.1.0-rc9
+  OMLE_REF: v0.1.1-rc1
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -72,6 +93,9 @@ jobs:
           - os: macos-latest
             target: macos-arm64
             container: ""
+          - os: windows-latest
+            target: windows-x86_64
+            container: ""
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -83,11 +107,13 @@ jobs:
       - uses: actions/checkout@v4.2.2
         with:
           repository: openmle/omle-runtime
+          ref: ${{ env.OMLE_RUNTIME_REF }}
           path: omle-runtime
       # omle-runtime generates omle.pb.cc from this repository's schema.
       - uses: actions/checkout@v4.2.2
         with:
           repository: openmle/omle
+          ref: ${{ env.OMLE_REF }}
           path: omle
 
       # Only the toolchain and the two libraries the bundled build still links
@@ -111,18 +137,55 @@ jobs:
         # the SDK, so only OpenSSL has to be installed.
         run: brew install cmake ninja openssl@3
 
+      # Not for Linux: the manylinux container supplies its own interpreters.
       - uses: actions/setup-python@v5.6.0
-        if: runner.os == 'macOS'
+        if: runner.os != 'Linux'
         with:
           python-version: "3.12"
 
+      # Windows has no apt or brew for Drogon and gRPC. Conan provides them as
+      # prebuilt msvc binaries, statically linked, so the executable is still
+      # self-contained. -pr:a applies the pinned profile to the host and build
+      # contexts: [tool_requires] resolves in the latter, and settings passed
+      # with -s reach only the former. --build=never fails fast if a binary is
+      # ever absent rather than silently building gRPC from source.
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        working-directory: omle-server
+        shell: bash
+        run: |
+          pip install conan
+          conan install . \
+            --output-folder=build/conan \
+            --build=never \
+            -pr:a=conan/profiles/windows-msvc
+
       - name: Build the self-contained binary
+        if: runner.os != 'Windows'
         working-directory: omle-server
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DOMLE_SERVER_BUNDLE_DEPS=ON
           cmake --build build --target omle_server -j 4
+
+      # No -G: CMake then defaults to the Visual Studio generator and builds
+      # with MSVC, matching every other Windows artifact in the project.
+      # Forcing Ninja would pick up the runner's MinGW GCC instead, giving a
+      # binary with a different C++ runtime. Visual Studio is multi-config, so
+      # --config carries the build type rather than CMAKE_BUILD_TYPE, and the
+      # output lands in build/Release/.
+      - name: Build the self-contained binary (Windows)
+        if: runner.os == 'Windows'
+        working-directory: omle-server
+        shell: bash
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/build/conan/conan_toolchain.cmake" \
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOMLE_SERVER_BUNDLE_DEPS=OFF
+          cmake --build build --target omle_server --config Release -j 4
 
       - name: Assert it links nothing it should have absorbed
         working-directory: omle-server
@@ -136,6 +199,21 @@ jobs:
           case "$RUNNER_OS" in
             Linux) LEAKED=$(ldd "$BIN" | grep -ciE 'grpc|absl|protobuf|drogon|trantor|simdjson|omleruntime' || true) ;;
             macOS) LEAKED=$(otool -L "$BIN" | grep -ciE 'grpc|absl|protobuf|drogon|trantor|simdjson|omleruntime' || true) ;;
+            Windows)
+              BIN=build/Release/omle_server.exe
+              # dumpbin is the MSVC equivalent of ldd, but it is not on PATH
+              # outside a developer prompt, so it is located under the VS
+              # install rather than assumed. Failing to find it is fatal: this
+              # check silently passing is how an unverified wheel ships.
+              DUMPBIN=$(find "/c/Program Files/Microsoft Visual Studio" \
+                             "/c/Program Files (x86)/Microsoft Visual Studio" \
+                        -name dumpbin.exe -path '*Hostx64/x64*' 2>/dev/null | head -1)
+              if [ -z "$DUMPBIN" ]; then
+                echo "::error::dumpbin.exe not found; cannot verify $BIN"
+                exit 1
+              fi
+              LEAKED=$("$DUMPBIN" //dependents "$BIN" | grep -ciE 'grpc|absl|protobuf|drogon|trantor|simdjson|omleruntime' || true)
+              ;;
           esac
           if [ "$LEAKED" -ne 0 ]; then
             echo "::error::$BIN links $LEAKED libraries the bundled build should"
@@ -155,8 +233,14 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip build
           mkdir -p python/omle_server/bin
-          cp build/omle_server python/omle_server/bin/
-          chmod 755 python/omle_server/bin/omle_server
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Multi-config generator, and the .exe suffix the console script
+            # and python/tests/conftest.py both expect.
+            cp build/Release/omle_server.exe python/omle_server/bin/
+          else
+            cp build/omle_server python/omle_server/bin/
+            chmod 755 python/omle_server/bin/omle_server
+          fi
           cd python && python3 -m build --wheel
 
       # Retags the wheel to the manylinux baseline PyPI accepts. --exclude
@@ -182,6 +266,18 @@ jobs:
             --exclude libssl --exclude libcrypto \
             dist/*.whl
 
+      # auditwheel and delocate write wheelhouse/ as part of repairing. Windows
+      # has neither and needs none — nothing is vendored in beyond what MSVC
+      # statically linked — but the steps below read wheelhouse/, so the wheel
+      # is moved there unchanged rather than special-casing two later steps.
+      - name: Collect the wheel (Windows)
+        if: runner.os == 'Windows'
+        working-directory: omle-server/python
+        shell: bash
+        run: |
+          mkdir -p wheelhouse
+          cp dist/*.whl wheelhouse/
+
       - name: Show what shipped
         working-directory: omle-server/python
         shell: bash
@@ -194,7 +290,7 @@ jobs:
             python3 - "$whl" <<'PY'
           import sys, zipfile
           names = zipfile.ZipFile(sys.argv[1]).namelist()
-          binaries = [n for n in names if "/bin/omle_server" in n]
+          binaries = [n for n in names if "/bin/omle_server" in n]  # matches .exe too
           for n in sorted(names):
               print(f"  {n}")
           if not binaries:

@@ -45,28 +45,38 @@ jobs:
   # Build, then the C++ unit tests and the Python REST/gRPC integration tests.
   # ---------------------------------------------------------------------------
   build-and-test:
-    name: Build and test (${{ matrix.os }})
+    name: Build and test (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux and macOS use system packages: apt and brew both supply
-          # Drogon and gRPC, so these rows finish in minutes and exercise the
-          # unbundled path a developer following the README takes.
+          # Every row builds what publish.yml ships, so no released
+          # configuration goes untested and no tested one is unreleased.
+          #
+          # Linux and macOS take the bundled path: gRPC, Abseil, protobuf,
+          # Drogon, jsoncpp and simdjson are compiled from pinned source by
+          # cmake/bundled_deps.cmake and linked statically, leaving only
+          # OpenSSL and system libraries external. The apt and brew packages
+          # are deliberately absent — a system copy is the failure the bundled
+          # build exists to prevent, so installing one here would hide it.
           - os: ubuntu-latest
-            bundled: "OFF"
+            bundled: "ON"
+            label: ubuntu / bundled
           - os: macos-latest
-            bundled: "OFF"
-          # Windows has no apt or brew, but ConanCenter publishes prebuilt
-          # msvc binaries for every dependency here — including OpenSSL — so
-          # this row downloads them rather than compiling gRPC's submodule tree
-          # (Abseil, protobuf, BoringSSL, re2, c-ares) from source. Conan's
-          # CMakeDeps generator emits ordinary package config files, so this is
-          # the same unbundled find_package path Linux and macOS take; nothing
-          # in cmake/ is Conan-aware.
+            bundled: "ON"
+            label: macOS / bundled
+
+          # Windows is the exception, matching publish.yml. It has no apt or
+          # brew, and building gRPC's submodule tree (Abseil, protobuf,
+          # BoringSSL, re2, c-ares) from source there is slow enough to
+          # dominate the job. ConanCenter publishes prebuilt msvc binaries for
+          # all of it, including OpenSSL, and Conan's CMakeDeps generator emits
+          # ordinary package config files — so this is the plain find_package
+          # path and nothing in cmake/ is Conan-aware.
           - os: windows-latest
             bundled: "OFF"
+            label: windows / conan
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -87,39 +97,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Drogon, gRPC, protobuf and GTest are found with find_package and are not
-      # vendored, so they have to exist before configure. simdjson and
-      # nlohmann/json fall back to FetchContent when absent (see
-      # cmake/deps.cmake), but installing them keeps the build off the network.
+      # Only the toolchain and the three libraries the bundled build still
+      # resolves against the system. gRPC, Abseil, protobuf, Drogon, jsoncpp
+      # and simdjson must NOT be installed: cmake/bundled_deps.cmake compiles
+      # them from pinned source, and finding a system copy instead is the
+      # silent failure this row exists to catch. publish.yml's manylinux step
+      # installs the same three and nothing more.
       #
-      # jsoncpp, uuid and zlib are listed explicitly because DrogonConfig.cmake
-      # calls find_dependency(... REQUIRED) on all three, and
-      # --no-install-recommends means libdrogon-dev does not drag them in.
-      # The long tail here is Drogon's, not ours. Ubuntu builds libdrogon-dev
-      # with ORM support, so DrogonConfig.cmake calls find_dependency on
-      # PostgreSQL, SQLite, MySQL, Boost, Hiredis and yaml-cpp — every one of
-      # which must resolve before find_package(Drogon) reports success, even
-      # though this server touches no database. They fail one at a time, and
-      # each failure surfaces as a bare "Drogon not found".
-      #
-      # libmariadb-dev-compat is the non-obvious one: Drogon's FindMySQL wants
-      # the mysql_config script, which default-libmysqlclient-dev does not ship.
-      - name: Install dependencies (Linux)
+      # libssl is external by design — a vendored copy stops receiving the
+      # distribution's security updates. uuid and zlib are Drogon's: its own
+      # CMakeLists calls find_package(UUID REQUIRED) and find_package(ZLIB
+      # REQUIRED) on Linux even when built from source.
+      - name: Install the toolchain (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build \
-            libdrogon-dev libjsoncpp-dev uuid-dev zlib1g-dev \
-            libpq-dev libsqlite3-dev libmariadb-dev libmariadb-dev-compat \
-            libhiredis-dev libyaml-cpp-dev libboost-dev libbrotli-dev \
-            libgrpc++-dev protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
-            libgtest-dev \
-            libsimdjson-dev nlohmann-json3-dev
+            cmake ninja-build libssl-dev uuid-dev zlib1g-dev
 
-      - name: Install dependencies (macOS)
+      # macOS supplies UUID and zlib in the SDK, so only OpenSSL is installed.
+      - name: Install the toolchain (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake ninja drogon grpc protobuf googletest simdjson nlohmann-json
+        run: brew install cmake ninja openssl@3
 
       # Conan supplies Drogon, gRPC, protobuf, OpenSSL, GTest, simdjson and
       # nlohmann/json as prebuilt msvc binaries. This also retires the previous
