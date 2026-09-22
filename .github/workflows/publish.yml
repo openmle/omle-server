@@ -184,6 +184,33 @@ jobs:
             --build=${{ matrix.conan_build }} \
             -pr:a=conan/profiles/${{ matrix.profile }}
 
+          # --build=missing is necessary here (OpenSSL has no prebuilt shared
+          # variant) but it is also silent: if the runner's compiler ever stops
+          # matching the profile, every package_id changes and Conan quietly
+          # compiles the whole graph — gRPC, Abseil, protobuf, boost — turning a
+          # three-minute job into an hour-long one that still passes.
+          #
+          # So the expensive packages are asserted to have come prebuilt. This
+          # fails in seconds with the resolved profile in the log, which is what
+          # you need to see to fix the pin.
+          conan graph info . -pr:a=conan/profiles/${{ matrix.profile }} \
+            --format=json > /tmp/graph.json
+          python3 - <<'PYEOF'
+          import json
+          g = json.load(open("/tmp/graph.json"))
+          prebuilt = {"Download", "Cache", "Skip", "Platform"}
+          expensive = {"grpc", "protobuf", "abseil", "drogon", "boost"}
+          built = sorted({n.get("name") for n in g["graph"]["nodes"].values()
+                          if n.get("binary") and n["binary"] not in prebuilt
+                          and n.get("name") in expensive})
+          if built:
+              raise SystemExit(
+                  f"::error::{built} would be built from source. The profile no "
+                  "longer matches what ConanCenter publishes — check the "
+                  "compiler version and cppstd above against conan/profiles/.")
+          print("expensive packages all prebuilt")
+          PYEOF
+
       - name: Build the self-contained binary
         if: runner.os != 'Windows'
         working-directory: omle-server
@@ -216,6 +243,36 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
           cmake --build build --target omle_server --config Release -j 4
+
+      # Conan's macOS OpenSSL is built with install_name /lib/libssl.3.dylib,
+      # a path macOS does not have — there is no /lib, and no
+      # /usr/lib/libssl.3.dylib either, since the system ships LibreSSL inside
+      # the dyld shared cache. Mach-O records that install_name verbatim in
+      # every binary that links it (unlike ELF, which records the bare soname
+      # and lets the loader search), so the executable fails with
+      #
+      #   dyld: Library not loaded: /lib/libssl.3.dylib
+      #
+      # -L at link time does not affect what is recorded, so this is repaired
+      # afterwards. Pointing at Homebrew's copy keeps OpenSSL dynamic and
+      # patchable by `brew upgrade`, which is the whole reason it is excluded
+      # from the wheel; it is also exactly the linkage the bundled build
+      # produced before Conan.
+      - name: Repoint OpenSSL at the Homebrew copy (macOS)
+        if: runner.os == 'macOS'
+        working-directory: omle-server
+        shell: bash
+        run: |
+          BREW=$(brew --prefix openssl@3)
+          for lib in ssl crypto; do
+            install_name_tool -change "/lib/lib$lib.3.dylib" \
+              "$BREW/lib/lib$lib.3.dylib" "build/omle_server"
+          done
+          otool -L "build/omle_server" | tail -n +2 | awk '{print "  "$1}'
+          if otool -L "build/omle_server" | grep -q '^\s*/lib/'; then
+            echo "::error::still references /lib; install_name_tool did not apply"
+            exit 1
+          fi
 
       - name: Assert it links nothing it should have absorbed
         working-directory: omle-server
@@ -307,6 +364,78 @@ jobs:
         run: |
           mkdir -p wheelhouse
           cp dist/*.whl wheelhouse/
+
+      # The wheel must not reference the build machine's Conan cache.
+      #
+      # OpenSSL is linked shared so the system copy is used at runtime, and the
+      # repair steps above exclude it from the wheel for that reason. On macOS
+      # that leaves whatever load command the linker recorded, which for a
+      # Conan package is an absolute path under ~/.conan2/p/. Such a wheel
+      # installs, imports and passes any check that only looks for the binary —
+      # and then fails on every machine that is not this runner, because that
+      # path does not exist there.
+      #
+      # Checked on Linux too, where DT_NEEDED normally holds the bare soname
+      # and this should never fire.
+      - name: Assert the wheel references no build-machine paths
+        working-directory: omle-server/python
+        shell: bash
+        run: |
+          rm -rf _whlcheck && mkdir _whlcheck
+          python3 -c "
+          import glob, zipfile
+          zipfile.ZipFile(glob.glob('wheelhouse/*.whl')[0]).extractall('_whlcheck')
+          "
+          BIN=$(find _whlcheck -name 'omle_server' -o -name 'omle_server.exe' | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no binary in wheel"; exit 1; fi
+          case "$RUNNER_OS" in
+            macOS) REFS=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}') ;;
+            Linux) REFS=$(objdump -p "$BIN" | awk '/NEEDED|RUNPATH|RPATH/ {print $2}') ;;
+            *)     REFS="" ;;
+          esac
+          echo "$REFS" | sed 's/^/  /'
+
+          BAD=0
+          for ref in $REFS; do
+            # Relative names resolve at load time: a bare soname on Linux, or
+            # @rpath/@loader_path/@executable_path on macOS.
+            case "$ref" in
+              @*|*/) continue ;;
+              */*) : ;;
+              *) continue ;;
+            esac
+            # An absolute path into the build machine's package cache exists
+            # here and nowhere else.
+            case "$ref" in
+              *.conan2*|/home/runner/*|/Users/runner/*)
+                echo "::error::$ref points into the build machine's package cache"
+                BAD=1; continue ;;
+            esac
+            # System locations are exempt: since Big Sur, macOS ships its
+            # system dylibs in the dyld shared cache rather than on disk, so
+            # /usr/lib/libSystem.B.dylib is resolvable at load time while
+            # failing an -e test. Linux's are real files, but exempting the
+            # same prefixes there costs nothing.
+            case "$ref" in
+              /usr/lib/*|/System/*|/lib64/*|/usr/lib64/*) continue ;;
+            esac
+            # Any other absolute path that does not resolve even on the machine
+            # that produced the wheel cannot resolve anywhere. Conan's macOS
+            # OpenSSL carries install_name /lib/libssl.3.dylib, and macOS has
+            # no /lib at all — so excluding it from the wheel leaves a
+            # reference that can never be satisfied.
+            if [ ! -e "$ref" ]; then
+              echo "::error::$ref does not exist even on this runner"
+              BAD=1
+            fi
+          done
+          if [ "$BAD" -ne 0 ]; then
+            echo "::error::the wheel references libraries that will not resolve"
+            echo "on a user's machine. A library excluded from the wheel has to"
+            echo "resolve by soname or by a path that genuinely exists there."
+            exit 1
+          fi
+          echo "all references resolvable"
 
       - name: Show what shipped
         working-directory: omle-server/python

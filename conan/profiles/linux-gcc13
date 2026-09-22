@@ -19,21 +19,24 @@ compiler.cppstd=gnu17
 compiler.libcxx=libstdc++11
 build_type=Release
 
-# OpenSSL is declared platform-provided, so Conan neither downloads nor ships
-# it and CMake resolves the system copy — dynamically linked, and patched by
-# the distribution rather than by cutting a release. That is the rule stated at
-# the top of publish.yml, and the reason auditwheel and delocate exclude
-# libssl/libcrypto from the wheel.
+# OpenSSL is the one dependency taken as a shared library, so the binary links
+# it dynamically and picks up the system copy at runtime rather than freezing a
+# crypto library into the wheel. auditwheel and delocate exclude it for exactly
+# that reason, and the wheel then resolves libssl at load time against whatever
+# the machine provides.
 #
-# ConanCenter's own OpenSSL is static, so simply taking it would have frozen a
-# crypto library into every wheel. Declaring it here instead costs one
-# rebuild: trantor links OpenSSL directly, so its package_id changes and no
-# published binary matches. trantor is small, and gRPC, protobuf, Abseil,
-# Drogon and boost are all still downloaded. The CI job therefore passes
-# --build=missing on this platform rather than --build=never.
+# ConanCenter publishes no shared OpenSSL for this configuration, so it is
+# compiled from source — which is why the CI job passes --build=missing here
+# rather than --build=never. It is one package; gRPC, protobuf, Abseil, Drogon
+# and boost are still downloaded prebuilt.
 #
-# The version below only has to satisfy the recipes' ranges (gRPC asks for
-# >=1.1 <4); it is not checked against the machine. What actually gets linked
-# is whatever OpenSSL 3 the build environment provides.
-[platform_requires]
-openssl/3.6.4
+# Declaring it platform-provided instead would have avoided even that build,
+# but does not work: gRPC's recipe declares a component requirement on
+# openssl::ssl, and CMakeDeps refuses to generate for a dependency that is not
+# in the graph —
+#   "component '_grpc' required 'openssl::ssl', but 'openssl' is not a direct
+#    dependency"
+# Adding openssl to [requires] as well does not help; platform_requires removes
+# it from the graph either way.
+[options]
+openssl/*:shared=True

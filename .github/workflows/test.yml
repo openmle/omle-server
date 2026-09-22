@@ -168,6 +168,33 @@ jobs:
             --build=${{ matrix.conan_build }} \
             -pr:a=conan/profiles/${{ matrix.profile }}
 
+          # --build=missing is necessary here (OpenSSL has no prebuilt shared
+          # variant) but it is also silent: if the runner's compiler ever stops
+          # matching the profile, every package_id changes and Conan quietly
+          # compiles the whole graph — gRPC, Abseil, protobuf, boost — turning a
+          # three-minute job into an hour-long one that still passes.
+          #
+          # So the expensive packages are asserted to have come prebuilt. This
+          # fails in seconds with the resolved profile in the log, which is what
+          # you need to see to fix the pin.
+          conan graph info . -pr:a=conan/profiles/${{ matrix.profile }} \
+            --format=json > /tmp/graph.json
+          python3 - <<'PYEOF'
+          import json
+          g = json.load(open("/tmp/graph.json"))
+          prebuilt = {"Download", "Cache", "Skip", "Platform"}
+          expensive = {"grpc", "protobuf", "abseil", "drogon", "boost"}
+          built = sorted({n.get("name") for n in g["graph"]["nodes"].values()
+                          if n.get("binary") and n["binary"] not in prebuilt
+                          and n.get("name") in expensive})
+          if built:
+              raise SystemExit(
+                  f"::error::{built} would be built from source. The profile no "
+                  "longer matches what ConanCenter publishes — check the "
+                  "compiler version and cppstd above against conan/profiles/.")
+          print("expensive packages all prebuilt")
+          PYEOF
+
       # Caches the FetchContent downloads, which is what makes the bundled row
       # bearable: the cost there is cloning gRPC's submodules, not compiling
       # them. Keyed on bundled_deps.cmake, so bumping any pin in that file
@@ -225,6 +252,36 @@ jobs:
         # --config is required by the Visual Studio generator and ignored by
         # Ninja, so one line serves both.
         run: cmake --build build --config Release -j 4
+
+      # Conan's macOS OpenSSL is built with install_name /lib/libssl.3.dylib,
+      # a path macOS does not have — there is no /lib, and no
+      # /usr/lib/libssl.3.dylib either, since the system ships LibreSSL inside
+      # the dyld shared cache. Mach-O records that install_name verbatim in
+      # every binary that links it (unlike ELF, which records the bare soname
+      # and lets the loader search), so the executable fails with
+      #
+      #   dyld: Library not loaded: /lib/libssl.3.dylib
+      #
+      # -L at link time does not affect what is recorded, so this is repaired
+      # afterwards. Pointing at Homebrew's copy keeps OpenSSL dynamic and
+      # patchable by `brew upgrade`, which is the whole reason it is excluded
+      # from the wheel; it is also exactly the linkage the bundled build
+      # produced before Conan.
+      - name: Repoint OpenSSL at the Homebrew copy (macOS)
+        if: runner.os == 'macOS'
+        working-directory: omle-server
+        shell: bash
+        run: |
+          BREW=$(brew --prefix openssl@3)
+          for lib in ssl crypto; do
+            install_name_tool -change "/lib/lib$lib.3.dylib" \
+              "$BREW/lib/lib$lib.3.dylib" "build/omle_server"
+          done
+          otool -L "build/omle_server" | tail -n +2 | awk '{print "  "$1}'
+          if otool -L "build/omle_server" | grep -q '^\s*/lib/'; then
+            echo "::error::still references /lib; install_name_tool did not apply"
+            exit 1
+          fi
 
       - name: Assert the binary landed where the tests look for it
         working-directory: omle-server
