@@ -92,14 +92,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The one bundled row, and it has to be.
+          #
+          # ConanCenter builds its Linux binaries with gcc 13, so they require
+          # GLIBCXX_3.4.32 and GLIBC_2.34. No manylinux image provides the
+          # former: 2_28 has GLIBCXX_3.4.25, and even 2_34 — which does have
+          # glibc 2.34 — ships only libstdc++.so.6.0.29 (GLIBCXX_3.4.29),
+          # because Red Hat holds the runtime at that version for ABI
+          # stability while shipping gcc 14. Conan's protoc will not exec
+          # there, and its static libraries would embed 3.4.32 references into
+          # omle_server itself, so auditwheel would reject the wheel anyway.
+          #
+          # Building the dependencies from pinned source against the old glibc
+          # is exactly what manylinux exists for.
           - os: ubuntu-latest
             target: linux-x86_64
             container: quay.io/pypa/manylinux_2_28_x86_64
-            bundled: "OFF"
-            profile: linux-gcc13
-            # --build=missing because OpenSSL is platform-provided; see
-            # conan/profiles/linux-gcc13.
-            conan_build: missing
+            bundled: "ON"
+            profile: ""
+            conan_build: ""
           # Apple silicon only, matching omle-runtime. An Intel Mac builds from
           # source.
           - os: macos-latest
@@ -150,36 +161,20 @@ jobs:
           # because Drogon's own CMakeLists calls find_package(UUID REQUIRED)
           # and find_package(ZLIB REQUIRED) on Linux — it builds from source
           # here but still resolves those two against the system.
-          # perl-core, and deliberately NOT openssl-devel.
+          # openssl, uuid and zlib: the three libraries the bundled build still
+          # resolves against the system. gRPC, Abseil, protobuf, Drogon,
+          # jsoncpp and simdjson are compiled from pinned source by
+          # cmake/bundled_deps.cmake and must NOT be installed — finding a
+          # system copy is the failure that build exists to prevent, and the
+          # "links nothing it should have absorbed" assert below catches it.
           #
-          # OpenSSL comes from Conan as a shared library, so the binary records
-          # only the soname libssl.so.3 and resolves it against the user's
-          # system at load time — auditwheel excludes it from the wheel. That
-          # is the point: crypto stays patchable by the distribution.
+          # OpenSSL is external by design: a vendored libssl stops receiving
+          # the distribution's security updates. Drogon's own CMakeLists calls
+          # find_package on UUID and ZLIB even when built from source.
           #
-          # ConanCenter publishes no shared OpenSSL, so Conan compiles one, and
-          # OpenSSL's build is a Perl program that pulls in modules at several
-          # stages. This image is a minimal AlmaLinux 8 and has almost none of
-          # them, one stage at a time:
-          #
-          #   Can't locate IPC/Cmd.pm in @INC      (config.pm, during Configure)
-          #   Can't locate Time/Piece.pm in @INC   (Makefile.in, after Configure)
-          #
-          # perl-core rather than those two by name: it is the metapackage for
-          # Perl's whole standard library, so a later stage cannot introduce a
-          # third round-trip. Naming modules individually is how this took two
-          # CI runs to not fix.
-          #
-          # (dnf aborts the whole transaction on an unknown package name, so
-          # every name here must exist — perl-FindBin, for instance, does not.)
-          #
-          # openssl-devel is omitted on purpose: this image's is 1.1.1k, EOL
-          # since 2023, and its soname is libssl.so.1.1. Linking it would make
-          # a wheel that cannot load on Ubuntu 22.04+, Debian 12 or RHEL 9,
-          # all of which ship libssl.so.3. EPEL's openssl3-devel would provide
-          # a matching one, but nothing here needs system OpenSSL headers:
-          # every dependency that uses OpenSSL comes from Conan.
-          dnf install -y cmake ninja-build git perl-core
+          # No perl here: nothing builds OpenSSL from source on this path, so
+          # the Perl modules its Configure needs are not required either.
+          dnf install -y cmake ninja-build git openssl-devel libuuid-devel zlib-devel
 
           # Put one of manylinux's own interpreters on PATH.
           #

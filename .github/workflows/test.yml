@@ -59,16 +59,17 @@ jobs:
           # ConanCenter's default is shared=False, so the executable is linked
           # from the same static libraries cmake/bundled_deps.cmake would
           # produce, without compiling gRPC's submodule tree to get them.
+          # Linux is bundled, matching publish.yml — and it has to be there,
+          # so it is here too. ConanCenter's Linux binaries are built with
+          # gcc 13 and need GLIBCXX_3.4.32, which no manylinux image provides
+          # (2_28 has 3.4.25; 2_34 has 3.4.29), so the wheel cannot be built
+          # with them. Testing the Conan path here while shipping the bundled
+          # one would leave the released configuration untested.
           - os: ubuntu-latest
-            bundled: "OFF"
-            profile: linux-gcc13
-            # --build=missing, not never: the profiles declare OpenSSL
-            # platform-provided so the wheel links the system copy, and that
-            # changes trantor's package_id because trantor links OpenSSL
-            # directly. trantor is small; gRPC, protobuf, Abseil and Drogon are
-            # all still downloaded.
-            conan_build: missing
-            label: ubuntu x86_64 / conan
+            bundled: "ON"
+            profile: ""
+            conan_build: ""
+            label: ubuntu x86_64 / bundled
           - os: macos-latest
             bundled: "OFF"
             profile: macos-armv8
@@ -116,20 +117,18 @@ jobs:
       # distribution's security updates. uuid and zlib are Drogon's: its own
       # CMakeLists calls find_package(UUID REQUIRED) and find_package(ZLIB
       # REQUIRED) on Linux even when built from source.
-      # The toolchain, plus OpenSSL. gRPC, Drogon, protobuf, Abseil, jsoncpp
-      # and simdjson all come from Conan and must NOT be installed here — a
-      # system copy is what would get linked instead of the pinned one.
-      #
-      # OpenSSL is the deliberate exception: the Conan profiles declare it
-      # platform-provided precisely so the binary links the system copy and
-      # keeps receiving the distribution's security updates, so it has to be
-      # present at build time.
+      # Linux builds its dependencies from pinned source, so only the
+      # toolchain and the three libraries that build still resolves against
+      # the system. gRPC, Drogon, protobuf, Abseil, jsoncpp and simdjson must
+      # NOT be installed: finding a system copy is the failure the bundled
+      # build exists to prevent. OpenSSL stays external by design, and Drogon
+      # calls find_package on UUID and ZLIB even when built from source.
       - name: Install the toolchain (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libssl-dev
+            cmake ninja-build libssl-dev uuid-dev zlib1g-dev
 
       - name: Install the toolchain (macOS)
         if: runner.os == 'macOS'
