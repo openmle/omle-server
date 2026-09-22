@@ -54,29 +54,37 @@ jobs:
           # Every row builds what publish.yml ships, so no released
           # configuration goes untested and no tested one is unreleased.
           #
-          # Linux and macOS take the bundled path: gRPC, Abseil, protobuf,
-          # Drogon, jsoncpp and simdjson are compiled from pinned source by
-          # cmake/bundled_deps.cmake and linked statically, leaving only
-          # OpenSSL and system libraries external. The apt and brew packages
-          # are deliberately absent — a system copy is the failure the bundled
-          # build exists to prevent, so installing one here would hide it.
+          # Every row takes its dependencies from ConanCenter as prebuilt
+          # static archives. That is not a different kind of build:
+          # ConanCenter's default is shared=False, so the executable is linked
+          # from the same static libraries cmake/bundled_deps.cmake would
+          # produce, without compiling gRPC's submodule tree to get them.
           - os: ubuntu-latest
-            bundled: "ON"
-            label: ubuntu / bundled
+            bundled: "OFF"
+            profile: linux-gcc13
+            # --build=missing, not never: the profiles declare OpenSSL
+            # platform-provided so the wheel links the system copy, and that
+            # changes trantor's package_id because trantor links OpenSSL
+            # directly. trantor is small; gRPC, protobuf, Abseil and Drogon are
+            # all still downloaded.
+            conan_build: missing
+            label: ubuntu x86_64 / conan
           - os: macos-latest
-            bundled: "ON"
-            label: macOS / bundled
-
-          # Windows is the exception, matching publish.yml. It has no apt or
-          # brew, and building gRPC's submodule tree (Abseil, protobuf,
-          # BoringSSL, re2, c-ares) from source there is slow enough to
-          # dominate the job. ConanCenter publishes prebuilt msvc binaries for
-          # all of it, including OpenSSL, and Conan's CMakeDeps generator emits
-          # ordinary package config files — so this is the plain find_package
-          # path and nothing in cmake/ is Conan-aware.
+            bundled: "OFF"
+            profile: macos-armv8
+            # --build=missing, not never: simdjson's macOS binary was built in
+            # an older epoch (apple-clang 13) than gRPC's (apple-clang 17), and
+            # ConanCenter ships no macOS arm64 libbacktrace at all. Those two
+            # compile from source; they are one translation unit and a small C
+            # library, not gRPC.
+            conan_build: missing
+            label: macOS arm64 / conan
           - os: windows-latest
             bundled: "OFF"
+            profile: windows-msvc
+            conan_build: never
             label: windows / conan
+
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -108,33 +116,34 @@ jobs:
       # distribution's security updates. uuid and zlib are Drogon's: its own
       # CMakeLists calls find_package(UUID REQUIRED) and find_package(ZLIB
       # REQUIRED) on Linux even when built from source.
+      # The toolchain, plus OpenSSL. gRPC, Drogon, protobuf, Abseil, jsoncpp
+      # and simdjson all come from Conan and must NOT be installed here — a
+      # system copy is what would get linked instead of the pinned one.
+      #
+      # OpenSSL is the deliberate exception: the Conan profiles declare it
+      # platform-provided precisely so the binary links the system copy and
+      # keeps receiving the distribution's security updates, so it has to be
+      # present at build time.
       - name: Install the toolchain (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libssl-dev uuid-dev zlib1g-dev
+            cmake ninja-build libssl-dev
 
-      # macOS supplies UUID and zlib in the SDK, so only OpenSSL is installed.
       - name: Install the toolchain (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake ninja openssl@3
 
-      # Conan supplies Drogon, gRPC, protobuf, OpenSSL, GTest, simdjson and
-      # nlohmann/json as prebuilt msvc binaries. This also retires the previous
-      # hunt for an MSVC OpenSSL on the runner: the bundled build needed one
-      # because gRPC uses SSL_PROVIDER=package and trantor links it too, and
-      # the runner's only other copy is Strawberry Perl's MinGW build, which
-      # cannot be linked into MSVC objects.
       - name: Cache the Conan package cache
-        if: runner.os == 'Windows'
+        if: matrix.bundled == 'OFF'
         uses: actions/cache@v4
         with:
           path: ~/.conan2/p
-          key: conan-${{ runner.os }}-${{ hashFiles('omle-server/conanfile.txt', 'omle-server/conan/profiles/windows-msvc') }}
+          key: conan-${{ matrix.profile }}-${{ hashFiles('omle-server/conanfile.txt', format('omle-server/conan/profiles/{0}', matrix.profile)) }}
 
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
+      - name: Install dependencies (Conan)
+        if: matrix.bundled == 'OFF'
         working-directory: omle-server
         shell: bash
         run: |
@@ -142,21 +151,22 @@ jobs:
 
           # -pr:a, not `conan profile detect`, and not -s flags.
           #
-          # :a applies the profile to the host *and* build contexts. Settings
-          # given as -s reach only the host, so [tool_requires] kept detect's
+          # :a applies the profile to the host *and* build contexts.
+          # [tool_requires] resolves in the build context, and settings passed
+          # with -s reach only the host, so a detected build profile kept
           # cppstd=14 and protobuf and gRPC — which require 17 — were rejected
           # outright: "Invalid: Current cppstd (14) is lower than the required
-          # C++ standard (17)". The host context failed more quietly, with
-          # every package "Missing", because a detected profile that differs in
-          # any setting yields package_ids nothing was ever built for.
+          # C++ standard (17)". The host context failed more quietly, every
+          # package "Missing", because a profile differing in any setting
+          # yields package_ids nothing was ever built for.
           #
-          # --build=never keeps that loud. A missing binary fails here in
-          # seconds naming the package, instead of silently falling back to
-          # building gRPC from source and going green forty minutes later.
+          # --build=never on the rows where nothing should need building, so a
+          # miss fails here in seconds naming the package rather than silently
+          # compiling gRPC from source and going green forty minutes later.
           conan install . \
             --output-folder=build/conan \
-            --build=never \
-            -pr:a=conan/profiles/windows-msvc
+            --build=${{ matrix.conan_build }} \
+            -pr:a=conan/profiles/${{ matrix.profile }}
 
       # Caches the FetchContent downloads, which is what makes the bundled row
       # bearable: the cost there is cloning gRPC's submodules, not compiling
@@ -190,11 +200,16 @@ jobs:
           EXTRA=""
           if [ "$RUNNER_OS" = "Windows" ]; then
             GEN=""
+          fi
+          # Every Conan row, not just Windows: the generated toolchain is what
+          # points find_package at the downloaded packages.
+          if [ "${{ matrix.bundled }}" = "OFF" ]; then
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
             # CMP0091 NEW is what lets the toolchain set the MSVC runtime
             # through CMAKE_MSVC_RUNTIME_LIBRARY; without it the flag is baked
             # into CMAKE_CXX_FLAGS instead and Conan's setting is ignored,
-            # giving a runtime mismatch against the downloaded binaries.
-            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
+            # giving a runtime mismatch against the downloaded binaries. It is
+            # a no-op off Windows.
             EXTRA="$EXTRA -DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
           fi
           cmake -S . -B build $GEN $EXTRA \

@@ -1,9 +1,17 @@
-# Conan dependency set, used only by the Windows CI job.
+# Conan dependency set for Linux x86_64, macOS arm64 and Windows.
 #
-# Linux and macOS install Drogon and gRPC from apt and brew; Windows has
-# neither, and building gRPC from source there means cloning Abseil, protobuf,
-# BoringSSL, re2 and c-ares and compiling the lot. ConanCenter publishes
-# prebuilt binaries for msvc, so that row downloads instead of builds.
+# ConanCenter's default is shared=False, so its binaries are the static
+# archives this project wants: they link into one self-contained executable
+# without compiling gRPC's submodule tree (Abseil, protobuf, BoringSSL, re2,
+# c-ares) from source on every build.
+#
+# Linux aarch64 is the exception and still uses cmake/bundled_deps.cmake:
+# ConanCenter publishes no aarch64 Linux binaries at all, so every package
+# there would build from source, which is what this file exists to avoid.
+#
+# Homebrew and conda were both evaluated and neither works. Homebrew ships
+# gRPC, Drogon, Abseil and jsoncpp as shared libraries only, with no .a at
+# all. conda-forge has libgrpc but no Drogon on any channel.
 #
 # This changes nothing about how the project is built: cmake/deps.cmake already
 # locates everything through find_package(... CONFIG), and Conan's CMakeDeps
@@ -20,13 +28,15 @@
 #
 # and any pin reported under "Missing packages" was moved until it resolved.
 # drogon 1.9.12 (the bundled pin) and gtest 1.16.0 both had to move for this
-# reason; simdjson and nlohmann_json match bundled_deps.cmake exactly, and gRPC
-# is 1.83.1 against a bundled v1.84.0, which ConanCenter does not carry.
+# reason, and simdjson had to move twice: 3.10.1 matches bundled_deps.cmake and
+# has a Windows binary, but no Linux or macOS one. 3.13.0 is the oldest pin
+# with all three. gRPC is 1.83.1 against a bundled v1.84.0, which ConanCenter
+# does not carry.
 
 [requires]
 grpc/1.83.1
 drogon/1.9.13
-simdjson/3.10.1
+simdjson/3.13.0
 nlohmann_json/3.11.3
 gtest/1.17.0
 

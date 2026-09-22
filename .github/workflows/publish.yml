@@ -29,18 +29,30 @@ name: Publish omle-server
 #     ubuntu-latest), which PyPI rejects and almost no deployment target
 #     matches. This is the same baseline omle-runtime's wheels use.
 #
-# Platforms match omle-runtime's wheel matrix, Windows included. Windows is the
-# one row that does NOT use OMLE_SERVER_BUNDLE_DEPS=ON: it takes its
-# dependencies from ConanCenter as prebuilt msvc binaries, statically linked,
-# which produces the same self-contained executable without compiling gRPC's
-# submodule tree. See conanfile.txt and conan/profiles/windows-msvc.
+# Every row takes its dependencies from ConanCenter rather than building them.
+# Its default is shared=False, so those are the same static archives
+# cmake/bundled_deps.cmake would produce, linked into the same self-contained
+# executable without compiling gRPC's submodule tree to get them. See
+# conanfile.txt and conan/profiles/.
 #
-# That row also departs from the OpenSSL rule above, unavoidably. Linux and
-# macOS have a system OpenSSL to link against; Windows does not, so the Conan
-# profile links it statically and the Windows wheel does carry a crypto
-# library frozen at build time. Patching it there means cutting a release. The
-# alternative — making every Windows user install OpenSSL themselves — is
-# worse, but the tradeoff is real and belongs in the release notes.
+# OpenSSL is the exception, and stays dynamic on every platform that has a
+# system copy: the Linux and macOS profiles declare it platform-provided, so
+# Conan neither downloads nor ships it and the binary links the system library
+# — which is what the --exclude flags below keep out of the wheel, and what
+# keeps a crypto library out of a release-only patch cycle. Windows has no
+# system OpenSSL, so there it is statically linked and that one wheel does
+# carry crypto frozen at build time.
+#
+# Homebrew and conda were evaluated as sources of prebuilt static libraries and
+# neither works: Homebrew ships gRPC, Drogon, Abseil and jsoncpp as shared
+# libraries with no .a at all, and conda-forge has no Drogon on any channel.
+#
+# Linux aarch64 is not built. ConanCenter publishes no aarch64 Linux binaries
+# for any of these packages, so that row would have had to compile all of them
+# from source. Anyone on aarch64 installs from source instead.
+#
+# Note that with no bundled row left, cmake/bundled_deps.cmake is no longer
+# exercised by CI on any platform, here or in test.yml.
 
 on:
   workflow_dispatch:
@@ -83,19 +95,27 @@ jobs:
           - os: ubuntu-latest
             target: linux-x86_64
             container: quay.io/pypa/manylinux_2_28_x86_64
-          # Free arm64 Linux runners are public-repository only; drop this row
-          # if that does not apply, at the cost of aarch64 wheels.
-          - os: ubuntu-24.04-arm
-            target: linux-aarch64
-            container: quay.io/pypa/manylinux_2_28_aarch64
+            bundled: "OFF"
+            profile: linux-gcc13
+            # --build=missing because OpenSSL is platform-provided; see
+            # conan/profiles/linux-gcc13.
+            conan_build: missing
           # Apple silicon only, matching omle-runtime. An Intel Mac builds from
           # source.
           - os: macos-latest
             target: macos-arm64
             container: ""
+            bundled: "OFF"
+            profile: macos-armv8
+            # simdjson and libbacktrace have no matching macOS arm64 binary;
+            # both are small. See conan/profiles/macos-armv8.
+            conan_build: missing
           - os: windows-latest
             target: windows-x86_64
             container: ""
+            bundled: "OFF"
+            profile: windows-msvc
+            conan_build: never
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -129,12 +149,16 @@ jobs:
           # because Drogon's own CMakeLists calls find_package(UUID REQUIRED)
           # and find_package(ZLIB REQUIRED) on Linux — it builds from source
           # here but still resolves those two against the system.
-          dnf install -y cmake ninja-build git openssl-devel libuuid-devel zlib-devel
+          # openssl-devel is required, not optional: the Conan profile declares
+          # OpenSSL platform-provided so that the wheel links the system copy
+          # and stays patchable by the distribution, which means it has to be
+          # here at build time. Everything else comes from ConanCenter.
+          dnf install -y cmake ninja-build git openssl-devel
 
       - name: Install the toolchain (macOS)
         if: runner.os == 'macOS'
-        # No jsoncpp here either — vendored. macOS supplies UUID and zlib in
-        # the SDK, so only OpenSSL has to be installed.
+        # OpenSSL is platform-provided by the Conan profile, so Homebrew's copy
+        # is what the binary links and delocate excludes from the wheel.
         run: brew install cmake ninja openssl@3
 
       # Not for Linux: the manylinux container supplies its own interpreters.
@@ -149,24 +173,30 @@ jobs:
       # contexts: [tool_requires] resolves in the latter, and settings passed
       # with -s reach only the former. --build=never fails fast if a binary is
       # ever absent rather than silently building gRPC from source.
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
+      - name: Install dependencies (Conan)
+        if: matrix.bundled == 'OFF'
         working-directory: omle-server
         shell: bash
         run: |
-          pip install conan
+          python3 -m pip install conan
           conan install . \
             --output-folder=build/conan \
-            --build=never \
-            -pr:a=conan/profiles/windows-msvc
+            --build=${{ matrix.conan_build }} \
+            -pr:a=conan/profiles/${{ matrix.profile }}
 
       - name: Build the self-contained binary
         if: runner.os != 'Windows'
         working-directory: omle-server
+        shell: bash
         run: |
+          # The toolchain file is what points find_package at the packages
+          # Conan downloaded. OMLE_SERVER_BUNDLE_DEPS stays a real option —
+          # bundled_deps.cmake still works for building from source — but no
+          # row here uses it.
           cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/build/conan/conan_toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DOMLE_SERVER_BUNDLE_DEPS=ON
+            -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
           cmake --build build --target omle_server -j 4
 
       # No -G: CMake then defaults to the Visual Studio generator and builds
@@ -184,7 +214,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/build/conan/conan_toolchain.cmake" \
             -DCMAKE_POLICY_DEFAULT_CMP0091=NEW \
             -DCMAKE_BUILD_TYPE=Release \
-            -DOMLE_SERVER_BUNDLE_DEPS=OFF
+            -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
           cmake --build build --target omle_server --config Release -j 4
 
       - name: Assert it links nothing it should have absorbed
@@ -252,7 +282,7 @@ jobs:
         run: |
           python3 -m pip install auditwheel
           auditwheel repair dist/*.whl -w wheelhouse/ \
-            --plat manylinux_2_28_${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }} \
+            --plat manylinux_2_28_x86_64 \
             --exclude libssl.so.3 --exclude libcrypto.so.3
 
       - name: Repair the wheel (macOS)

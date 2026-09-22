@@ -1,0 +1,45 @@
+# Conan profile for the macOS arm64 CI job. Pinned, not detected.
+#
+# See linux-gcc13 for why cppstd is gnu17 rather than 17.
+#
+# apple-clang 17 is what ConanCenter built gRPC, Drogon, protobuf, Abseil and
+# OpenSSL with. Two packages in the graph do not match it and are compiled from
+# source instead:
+#
+#   simdjson      its macOS binary was built with apple-clang 13 at cppstd=17,
+#                 a different build epoch; no single profile satisfies both it
+#                 and gRPC.
+#   libbacktrace  ConanCenter publishes no macOS arm64 binary at all.
+#
+# Both are small — one translation unit and a small C library — so the CI job
+# passes --build=missing rather than --build=never here. That is a deliberate
+# difference from Windows and Linux, where --build=never is correct because
+# nothing should ever need building and a miss must fail loudly.
+
+[settings]
+os=Macos
+arch=armv8
+compiler=apple-clang
+compiler.version=17
+compiler.cppstd=gnu17
+compiler.libcxx=libc++
+build_type=Release
+
+# OpenSSL is declared platform-provided, so Conan neither downloads nor ships
+# it and CMake resolves the system copy — dynamically linked, and patched by
+# the distribution rather than by cutting a release. That is the rule stated at
+# the top of publish.yml, and the reason auditwheel and delocate exclude
+# libssl/libcrypto from the wheel.
+#
+# ConanCenter's own OpenSSL is static, so simply taking it would have frozen a
+# crypto library into every wheel. Declaring it here instead costs one
+# rebuild: trantor links OpenSSL directly, so its package_id changes and no
+# published binary matches. trantor is small, and gRPC, protobuf, Abseil,
+# Drogon and boost are all still downloaded. The CI job therefore passes
+# --build=missing on this platform rather than --build=never.
+#
+# The version below only has to satisfy the recipes' ranges (gRPC asks for
+# >=1.1 <4); it is not checked against the machine. What actually gets linked
+# is whatever OpenSSL 3 the build environment provides.
+[platform_requires]
+openssl/3.6.4
