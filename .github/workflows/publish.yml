@@ -150,7 +150,7 @@ jobs:
           # because Drogon's own CMakeLists calls find_package(UUID REQUIRED)
           # and find_package(ZLIB REQUIRED) on Linux — it builds from source
           # here but still resolves those two against the system.
-          # perl-IPC-Cmd, and deliberately NOT openssl-devel.
+          # perl-core, and deliberately NOT openssl-devel.
           #
           # OpenSSL comes from Conan as a shared library, so the binary records
           # only the soname libssl.so.3 and resolves it against the user's
@@ -158,10 +158,17 @@ jobs:
           # is the point: crypto stays patchable by the distribution.
           #
           # ConanCenter publishes no shared OpenSSL, so Conan compiles one, and
-          # OpenSSL's Configure is a Perl script needing IPC::Cmd. This image
-          # is a minimal AlmaLinux 8 and does not have it:
+          # OpenSSL's build is a Perl program that pulls in modules at several
+          # stages. This image is a minimal AlmaLinux 8 and has almost none of
+          # them, one stage at a time:
           #
-          #   Can't locate IPC/Cmd.pm in @INC
+          #   Can't locate IPC/Cmd.pm in @INC      (config.pm, during Configure)
+          #   Can't locate Time/Piece.pm in @INC   (Makefile.in, after Configure)
+          #
+          # perl-core rather than those two by name: it is the metapackage for
+          # Perl's whole standard library, so a later stage cannot introduce a
+          # third round-trip. Naming modules individually is how this took two
+          # CI runs to not fix.
           #
           # (dnf aborts the whole transaction on an unknown package name, so
           # every name here must exist — perl-FindBin, for instance, does not.)
@@ -172,7 +179,7 @@ jobs:
           # all of which ship libssl.so.3. EPEL's openssl3-devel would provide
           # a matching one, but nothing here needs system OpenSSL headers:
           # every dependency that uses OpenSSL comes from Conan.
-          dnf install -y cmake ninja-build git perl-IPC-Cmd
+          dnf install -y cmake ninja-build git perl-core
 
           # Put one of manylinux's own interpreters on PATH.
           #
@@ -488,7 +495,27 @@ jobs:
           case "$RUNNER_OS" in
             macOS) REFS=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}') ;;
             Linux) REFS=$(objdump -p "$BIN" | awk '/NEEDED|RUNPATH|RPATH/ {print $2}') ;;
-            *)     REFS="" ;;
+            Windows)
+              # dumpbin is the MSVC equivalent and is not on PATH outside a
+              # developer prompt, so it is located under the VS install. PE
+              # imports are bare DLL names resolved by the loader's search
+              # order, like an ELF soname, so the path checks below simply do
+              # not fire — but the listing still has to be readable, which is
+              # what catches a truncated or unreadable binary.
+              DUMPBIN=$(find "/c/Program Files/Microsoft Visual Studio" \
+                             "/c/Program Files (x86)/Microsoft Visual Studio" \
+                        -name dumpbin.exe -path '*Hostx64/x64*' 2>/dev/null | head -1)
+              if [ -z "$DUMPBIN" ]; then
+                echo "::error::dumpbin.exe not found; cannot inspect $BIN"
+                exit 1
+              fi
+              REFS=$("$DUMPBIN" //dependents "$BIN" \
+                     | awk '/^ +[A-Za-z0-9_.+-]+\.[Dd][Ll][Ll]$/ {print $1}')
+              ;;
+            *)
+              echo "::error::no dependency inspector for $RUNNER_OS"
+              exit 1
+              ;;
           esac
           echo "$REFS" | sed 's/^/  /'
 
