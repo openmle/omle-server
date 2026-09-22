@@ -193,11 +193,15 @@ jobs:
           # So the expensive packages are asserted to have come prebuilt. This
           # fails in seconds with the resolved profile in the log, which is what
           # you need to see to fix the pin.
+          # A relative path, not /tmp: this step runs under bash on every
+          # platform, but the heredoc below is interpreted by native Windows
+          # Python, which reads an absolute "/tmp/..." as C:\tmp\... and not
+          # as git-bash's /tmp. The redirect succeeded and the open() failed.
           conan graph info . -pr:a=conan/profiles/${{ matrix.profile }} \
-            --format=json > /tmp/graph.json
+            --format=json > build/conan-graph.json
           python3 - <<'PYEOF'
           import json
-          g = json.load(open("/tmp/graph.json"))
+          g = json.load(open("build/conan-graph.json"))
           prebuilt = {"Download", "Cache", "Skip", "Platform"}
           expensive = {"grpc", "protobuf", "abseil", "drogon", "boost"}
           built = sorted({n.get("name") for n in g["graph"]["nodes"].values()
