@@ -186,6 +186,43 @@ set(BUILD_C-ARES      OFF CACHE BOOL "" FORCE)
 # vendored BoringSSL is not a drop-in replacement, so dropping it would mean
 # giving up HTTPS rather than just shedding a dependency. libssl/libcrypto
 # therefore remain external; see the README on what that means for deployment.
+
+# Resolve UUID ourselves, before Drogon can fail to.
+#
+# USE_STATIC_LIBS_ONLY above makes Drogon narrow CMAKE_FIND_LIBRARY_SUFFIXES to
+# .a for the rest of its configure, and its find_package(UUID) then searches
+# only for libuuid.a. No mainstream distribution ships one — libuuid-devel on
+# AlmaLinux, Debian and Ubuntu carries libuuid.so alone — so configure dies
+# with "Could not find UUID" on a machine where UUID is plainly installed.
+#
+# macOS never hit this: Drogon's FindUUID.cmake accepts an empty library on
+# Apple and BSD, so only Linux fails, which is why the bundled macOS build
+# passed while the manylinux wheel did not.
+#
+# FindUUID.cmake short-circuits when both cache variables are already set, so
+# finding them here with the normal suffixes skips its restricted search
+# entirely. The spellings mirror what it would have produced: the library by
+# plain name, and the directory *containing* uuid.h — Drogon's Utilities.cc
+# includes <uuid.h>, not <uuid/uuid.h>.
+#
+# libuuid stays a shared system library, like libssl. It is part of util-linux
+# and present everywhere; absorbing it would gain nothing.
+if(UNIX AND NOT APPLE)
+    find_library(OMLE_UUID_LIBRARY NAMES uuid)
+    find_path(OMLE_UUID_INCLUDE_DIR NAMES uuid.h PATH_SUFFIXES uuid)
+    if(OMLE_UUID_LIBRARY AND OMLE_UUID_INCLUDE_DIR)
+        set(UUID_LIBRARIES    "${OMLE_UUID_LIBRARY}"     CACHE STRING "" FORCE)
+        set(UUID_INCLUDE_DIRS "${OMLE_UUID_INCLUDE_DIR}" CACHE STRING "" FORCE)
+        message(STATUS "UUID (system)      : ${UUID_LIBRARIES}")
+    else()
+        message(FATAL_ERROR
+            "libuuid not found. Install it before configuring: "
+            "uuid-dev on Debian/Ubuntu, libuuid-devel on RHEL/Alma/Fedora. "
+            "Drogon requires it and its own search cannot see a shared one "
+            "once USE_STATIC_LIBS_ONLY narrows the library suffixes.")
+    endif()
+endif()
+
 FetchContent_Declare(drogon
     GIT_REPOSITORY https://github.com/drogonframework/drogon.git
     GIT_TAG        ${OMLE_DROGON_VERSION}
