@@ -124,13 +124,21 @@ target_include_directories(omle_server PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
-# omle_runtime_static vs omle_runtime: the latter is the SHARED library, which
-# would leave libomleruntime.dylib next to the binary and defeat the point.
-if(OMLE_SERVER_BUNDLE_DEPS)
-    set(OMLE_RUNTIME_LINK_TARGET omle_runtime_static)
-else()
-    set(OMLE_RUNTIME_LINK_TARGET omle_runtime)
-endif()
+# omle_runtime_static, always. omle-runtime defines both an `omle_runtime`
+# SHARED and an `omle_runtime_static` STATIC target; linking the former leaves
+# a libomleruntime.dylib/.so that has to travel beside the executable, which
+# defeats the point of shipping one self-contained binary.
+#
+# This used to be conditional on OMLE_SERVER_BUNDLE_DEPS, which was right while
+# bundling was the only way to get a self-contained build. It is not any more:
+# the Conan rows link prebuilt static archives with BUNDLE_DEPS=OFF and are
+# just as self-contained, but took the shared branch and produced a binary
+# carrying @rpath/libomleruntime.dylib — caught by publish.yml's "links nothing
+# it should have absorbed" assert.
+#
+# Where the dependencies come from and how omle-runtime is linked are separate
+# questions, so they no longer share a condition.
+set(OMLE_RUNTIME_LINK_TARGET omle_runtime_static)
 
 target_link_libraries(omle_server PRIVATE
     ${OMLE_RUNTIME_LINK_TARGET}

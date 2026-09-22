@@ -143,6 +143,7 @@ jobs:
       # avoid.
       - name: Install the toolchain (manylinux)
         if: runner.os == 'Linux'
+        shell: bash
         run: |
           # jsoncpp is NOT installed: bundled_deps.cmake vendors it, and a
           # system copy is what it exists to avoid. libuuid and zlib are needed
@@ -154,6 +155,34 @@ jobs:
           # and stays patchable by the distribution, which means it has to be
           # here at build time. Everything else comes from ConanCenter.
           dnf install -y cmake ninja-build git openssl-devel
+
+          # Put one of manylinux's own interpreters on PATH.
+          #
+          # The container's /usr/bin/python3 is a perfectly modern 3.12, but it
+          # ships no pip at all — "No module named pip". manylinux keeps the
+          # interpreters that do have pip under /opt/python/<tag>/bin and puts
+          # none of them on PATH. Verified against the image:
+          #
+          #   /usr/bin/python3                     3.12.14, no pip
+          #   /opt/python/cp312-cp312/bin/python3  3.12.14, pip 26.2.1
+          #
+          # Doing this here rather than in the Conan step keeps
+          # `python3 -m pip install conan` identical on all three platforms,
+          # and gives the wheel build below a modern python too.
+          PYBIN=$(ls -d /opt/python/cp312-cp312/bin 2>/dev/null || true)
+          if [ -z "$PYBIN" ]; then
+            # Excludes the free-threaded cp3XXt builds, which sort last and
+            # are not what a wheel-building job wants.
+            PYBIN=$(ls -d /opt/python/cp3*/bin 2>/dev/null \
+                    | grep -v 't/bin$' | sort -V | tail -1)
+          fi
+          if [ -z "$PYBIN" ]; then
+            echo "::error::no interpreter under /opt/python in this image"
+            exit 1
+          fi
+          echo "using $PYBIN"
+          "$PYBIN/python3" --version
+          echo "$PYBIN" >> "$GITHUB_PATH"
 
       - name: Install the toolchain (macOS)
         if: runner.os == 'macOS'
