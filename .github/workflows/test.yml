@@ -147,7 +147,7 @@ jobs:
         working-directory: omle-server
         shell: bash
         run: |
-          pip install conan
+          python3 -m pip install conan
 
           # -pr:a, not `conan profile detect`, and not -s flags.
           #
@@ -198,17 +198,6 @@ jobs:
                   "compiler version and cppstd above against conan/profiles/.")
           print("expensive packages all prebuilt")
           PYEOF
-
-      # Caches the FetchContent downloads, which is what makes the bundled row
-      # bearable: the cost there is cloning gRPC's submodules, not compiling
-      # them. Keyed on bundled_deps.cmake, so bumping any pin in that file
-      # invalidates it and nothing else does.
-      - name: Cache fetched dependency sources
-        if: matrix.bundled == 'ON'
-        uses: actions/cache@v4
-        with:
-          path: omle-server/build/_deps
-          key: deps-${{ runner.os }}-${{ hashFiles('omle-server/cmake/bundled_deps.cmake') }}
 
       - name: Configure
         working-directory: omle-server

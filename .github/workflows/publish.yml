@@ -173,6 +173,13 @@ jobs:
       # contexts: [tool_requires] resolves in the latter, and settings passed
       # with -s reach only the former. --build=never fails fast if a binary is
       # ever absent rather than silently building gRPC from source.
+      - name: Cache the Conan package cache
+        if: matrix.bundled == 'OFF'
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ matrix.profile }}-${{ hashFiles('omle-server/conanfile.txt', format('omle-server/conan/profiles/{0}', matrix.profile)) }}
+
       - name: Install dependencies (Conan)
         if: matrix.bundled == 'OFF'
         working-directory: omle-server
@@ -216,34 +223,34 @@ jobs:
           PYEOF
 
       - name: Build the self-contained binary
-        if: runner.os != 'Windows'
         working-directory: omle-server
         shell: bash
         run: |
-          # The toolchain file is what points find_package at the packages
-          # Conan downloaded. OMLE_SERVER_BUNDLE_DEPS stays a real option —
-          # bundled_deps.cmake still works for building from source — but no
-          # row here uses it.
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/build/conan/conan_toolchain.cmake" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
-          cmake --build build --target omle_server -j 4
-
-      # No -G: CMake then defaults to the Visual Studio generator and builds
-      # with MSVC, matching every other Windows artifact in the project.
-      # Forcing Ninja would pick up the runner's MinGW GCC instead, giving a
-      # binary with a different C++ runtime. Visual Studio is multi-config, so
-      # --config carries the build type rather than CMAKE_BUILD_TYPE, and the
-      # output lands in build/Release/.
-      - name: Build the self-contained binary (Windows)
-        if: runner.os == 'Windows'
-        working-directory: omle-server
-        shell: bash
-        run: |
-          cmake -S . -B build \
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/build/conan/conan_toolchain.cmake" \
-            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW \
+          # Same shape as test.yml's Configure/Build, so the wheel is produced
+          # by the configuration the tests exercised.
+          #
+          # No -G on Windows: CMake then defaults to the Visual Studio
+          # generator and builds with MSVC, which is what every other Windows
+          # artifact in the project uses. Forcing Ninja picks up whatever
+          # compiler is first on PATH — MinGW GCC on the runner image — giving a
+          # binary with a different C++ runtime. Visual Studio is multi-config,
+          # so --config carries the build type and the output lands in
+          # build/Release/.
+          #
+          # CMP0091 NEW lets the toolchain set the MSVC runtime through
+          # CMAKE_MSVC_RUNTIME_LIBRARY rather than baking it into
+          # CMAKE_CXX_FLAGS, which is what keeps it consistent with the
+          # downloaded binaries. It is a no-op off Windows.
+          GEN="-G Ninja"
+          EXTRA=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GEN=""
+          fi
+          if [ "${{ matrix.bundled }}" = "OFF" ]; then
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
+            EXTRA="$EXTRA -DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
+          fi
+          cmake -S . -B build $GEN $EXTRA \
             -DCMAKE_BUILD_TYPE=Release \
             -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
           cmake --build build --target omle_server --config Release -j 4
