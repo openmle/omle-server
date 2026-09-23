@@ -70,16 +70,17 @@ jobs:
             profile: ""
             conan_build: ""
             label: ubuntu x86_64 / bundled
+          # macOS is bundled so the wheel matches omle-runtime's reach.
+          # ConanCenter's macOS arm64 binaries are all built with minos 14.0,
+          # so anything linking them inherits a macOS 14 floor, while
+          # omle-runtime — which builds its dependencies from source — ships
+          # macosx_11_0_arm64. Building from source here buys back macOS 11,
+          # 12 and 13 at the cost of compile time.
           - os: macos-latest
-            bundled: "OFF"
-            profile: macos-armv8
-            # --build=missing, not never: simdjson's macOS binary was built in
-            # an older epoch (apple-clang 13) than gRPC's (apple-clang 17), and
-            # ConanCenter ships no macOS arm64 libbacktrace at all. Those two
-            # compile from source; they are one translation unit and a small C
-            # library, not gRPC.
-            conan_build: missing
-            label: macOS arm64 / conan
+            bundled: "ON"
+            profile: ""
+            conan_build: ""
+            label: macOS arm64 / bundled
           - os: windows-latest
             bundled: "OFF"
             profile: windows-msvc
@@ -247,12 +248,13 @@ jobs:
           # "Could not find a version that satisfies the requirement" — the
           # project is found, no distribution matches.
           #
-          # 14.0 is the floor, not a preference: ConanCenter's macOS arm64
-          # binaries are all built with minos 14.0, so nothing linking them can
-          # claim to support less. Lowering it would need the bundled path on
-          # macOS too.
+          # 11.0 matches omle-runtime, which ships macosx_11_0_arm64. It is
+          # reachable only because this row builds its dependencies from
+          # source; ConanCenter's macOS binaries carry minos 14.0 and would
+          # force a macOS 14 floor. 11.0 is the arm64 floor — no earlier macOS
+          # runs on Apple silicon.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            export MACOSX_DEPLOYMENT_TARGET=14.0
+            export MACOSX_DEPLOYMENT_TARGET=11.0
           fi
           # Every Conan row, not just Windows: the generated toolchain is what
           # points find_package at the downloaded packages.
@@ -278,50 +280,6 @@ jobs:
         # --config is required by the Visual Studio generator and ignored by
         # Ninja, so one line serves both.
         run: cmake --build build --config Release -j 4
-
-      # Conan's packaged macOS OpenSSL has install_name @rpath/libssl.3.dylib,
-      # and the rpaths CMake bakes in are absolute paths into the build
-      # machine's Conan cache. Mach-O records that reference verbatim (unlike
-      # ELF, which records the bare soname and lets the loader search), so the
-      # binary runs here and fails anywhere else with
-      #
-      #   dyld: Library not loaded: @rpath/libssl.3.dylib
-      #   Reason: no LC_RPATH's found
-      #
-      # -L at link time does not affect what is recorded, so this is repaired
-      # afterwards. Pointing at Homebrew's copy keeps OpenSSL dynamic and
-      # patchable by `brew upgrade`, which is the whole reason it is excluded
-      # from the wheel; it is also exactly the linkage the bundled build
-      # produced before Conan.
-      - name: Repoint OpenSSL at the Homebrew copy (macOS)
-        if: runner.os == 'macOS'
-        working-directory: omle-server
-        shell: bash
-        run: |
-          BREW=$(brew --prefix openssl@3)
-          for lib in ssl crypto; do
-            install_name_tool -change "@rpath/lib$lib.3.dylib" \
-              "$BREW/lib/lib$lib.3.dylib" "build/omle_server"
-          done
-
-          # Drop the rpaths Conan baked in. They are absolute paths into the
-          # build machine's package cache; leaving them would let the binary
-          # keep resolving OpenSSL here while failing everywhere else, which is
-          # precisely the bug this step exists to prevent — and it would hide
-          # it from the check below.
-          for rp in $(otool -l "build/omle_server" \
-                      | awk '/LC_RPATH/{f=1} f&&/path /{print $2; f=0}'); do
-            case "$rp" in
-              *.conan2*|*/conan*) install_name_tool -delete_rpath "$rp" "build/omle_server" || true ;;
-            esac
-          done
-
-          otool -L "build/omle_server" | tail -n +2 | awk '{print "  "$1}'
-          if otool -L "build/omle_server" | grep -qE '@rpath/lib(ssl|crypto)'; then
-            echo "::error::still references @rpath for OpenSSL; the install_name"
-            echo "did not match. Check it with: otool -D <conan>/lib/libssl.3.dylib"
-            exit 1
-          fi
 
       - name: Assert the binary landed where the tests look for it
         working-directory: omle-server

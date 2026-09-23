@@ -113,14 +113,15 @@ jobs:
             conan_build: ""
           # Apple silicon only, matching omle-runtime. An Intel Mac builds from
           # source.
+          # Bundled, to match omle-runtime's macosx_11_0_arm64 reach.
+          # ConanCenter's macOS arm64 binaries carry minos 14.0, which would
+          # force a macOS 14 floor on every wheel linking them.
           - os: macos-latest
             target: macos-arm64
             container: ""
-            bundled: "OFF"
-            profile: macos-armv8
-            # simdjson and libbacktrace have no matching macOS arm64 binary;
-            # both are small. See conan/profiles/macos-armv8.
-            conan_build: missing
+            bundled: "ON"
+            profile: ""
+            conan_build: ""
           - os: windows-latest
             target: windows-x86_64
             container: ""
@@ -341,12 +342,13 @@ jobs:
           # "Could not find a version that satisfies the requirement" — the
           # project is found, no distribution matches.
           #
-          # 14.0 is the floor, not a preference: ConanCenter's macOS arm64
-          # binaries are all built with minos 14.0, so nothing linking them can
-          # claim to support less. Lowering it would need the bundled path on
-          # macOS too.
+          # 11.0 matches omle-runtime, which ships macosx_11_0_arm64. It is
+          # reachable only because this row builds its dependencies from
+          # source; ConanCenter's macOS binaries carry minos 14.0 and would
+          # force a macOS 14 floor. 11.0 is the arm64 floor — no earlier macOS
+          # runs on Apple silicon.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            export MACOSX_DEPLOYMENT_TARGET=14.0
+            export MACOSX_DEPLOYMENT_TARGET=11.0
           fi
           if [ "${{ matrix.bundled }}" = "OFF" ]; then
             EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
@@ -364,50 +366,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
           cmake --build build --target omle_server --config Release -j 4
-
-      # Conan's packaged macOS OpenSSL has install_name @rpath/libssl.3.dylib,
-      # and the rpaths CMake bakes in are absolute paths into the build
-      # machine's Conan cache. Mach-O records that reference verbatim (unlike
-      # ELF, which records the bare soname and lets the loader search), so the
-      # binary runs here and fails anywhere else with
-      #
-      #   dyld: Library not loaded: @rpath/libssl.3.dylib
-      #   Reason: no LC_RPATH's found
-      #
-      # -L at link time does not affect what is recorded, so this is repaired
-      # afterwards. Pointing at Homebrew's copy keeps OpenSSL dynamic and
-      # patchable by `brew upgrade`, which is the whole reason it is excluded
-      # from the wheel; it is also exactly the linkage the bundled build
-      # produced before Conan.
-      - name: Repoint OpenSSL at the Homebrew copy (macOS)
-        if: runner.os == 'macOS'
-        working-directory: omle-server
-        shell: bash
-        run: |
-          BREW=$(brew --prefix openssl@3)
-          for lib in ssl crypto; do
-            install_name_tool -change "@rpath/lib$lib.3.dylib" \
-              "$BREW/lib/lib$lib.3.dylib" "build/omle_server"
-          done
-
-          # Drop the rpaths Conan baked in. They are absolute paths into the
-          # build machine's package cache; leaving them would let the binary
-          # keep resolving OpenSSL here while failing everywhere else, which is
-          # precisely the bug this step exists to prevent — and it would hide
-          # it from the check below.
-          for rp in $(otool -l "build/omle_server" \
-                      | awk '/LC_RPATH/{f=1} f&&/path /{print $2; f=0}'); do
-            case "$rp" in
-              *.conan2*|*/conan*) install_name_tool -delete_rpath "$rp" "build/omle_server" || true ;;
-            esac
-          done
-
-          otool -L "build/omle_server" | tail -n +2 | awk '{print "  "$1}'
-          if otool -L "build/omle_server" | grep -qE '@rpath/lib(ssl|crypto)'; then
-            echo "::error::still references @rpath for OpenSSL; the install_name"
-            echo "did not match. Check it with: otool -D <conan>/lib/libssl.3.dylib"
-            exit 1
-          fi
 
       - name: Assert it links nothing it should have absorbed
         working-directory: omle-server
@@ -469,9 +427,9 @@ jobs:
           # which is delocate being right: such a wheel would install on an
           # Intel Mac and then fail to exec. _PYTHON_HOST_PLATFORM is the
           # override setuptools honours for this, and is what cibuildwheel uses.
-          # 14.0 matches MACOSX_DEPLOYMENT_TARGET in the build step; see there.
+          # 11.0 matches MACOSX_DEPLOYMENT_TARGET in the build step; see there.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            export _PYTHON_HOST_PLATFORM=macosx-14.0-arm64
+            export _PYTHON_HOST_PLATFORM=macosx-11.0-arm64
             export ARCHFLAGS="-arch arm64"
           fi
 
