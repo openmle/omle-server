@@ -234,6 +234,26 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             GEN=""
           fi
+          # macOS: pin the deployment target, or the wheel is stamped with the
+          # runner's OS version.
+          #
+          # Left unset, the compiler targets the build machine, and the runner
+          # is macOS 26. delocate derives the wheel's minimum OS from the
+          # binary, so 0.1.0rc5 shipped as
+          #
+          #   omle_server-0.1.0rc5-py3-none-macosx_26_0_arm64.whl
+          #
+          # installable only on macOS 26+. On anything older pip reports
+          # "Could not find a version that satisfies the requirement" — the
+          # project is found, no distribution matches.
+          #
+          # 14.0 is the floor, not a preference: ConanCenter's macOS arm64
+          # binaries are all built with minos 14.0, so nothing linking them can
+          # claim to support less. Lowering it would need the bundled path on
+          # macOS too.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export MACOSX_DEPLOYMENT_TARGET=14.0
+          fi
           # Every Conan row, not just Windows: the generated toolchain is what
           # points find_package at the downloaded packages.
           if [ "${{ matrix.bundled }}" = "OFF" ]; then

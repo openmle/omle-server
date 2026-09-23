@@ -328,6 +328,26 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             GEN=""
           fi
+          # macOS: pin the deployment target, or the wheel is stamped with the
+          # runner's OS version.
+          #
+          # Left unset, the compiler targets the build machine, and the runner
+          # is macOS 26. delocate derives the wheel's minimum OS from the
+          # binary, so 0.1.0rc5 shipped as
+          #
+          #   omle_server-0.1.0rc5-py3-none-macosx_26_0_arm64.whl
+          #
+          # installable only on macOS 26+. On anything older pip reports
+          # "Could not find a version that satisfies the requirement" — the
+          # project is found, no distribution matches.
+          #
+          # 14.0 is the floor, not a preference: ConanCenter's macOS arm64
+          # binaries are all built with minos 14.0, so nothing linking them can
+          # claim to support less. Lowering it would need the bundled path on
+          # macOS too.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export MACOSX_DEPLOYMENT_TARGET=14.0
+          fi
           if [ "${{ matrix.bundled }}" = "OFF" ]; then
             EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
             EXTRA="$EXTRA -DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
@@ -449,9 +469,9 @@ jobs:
           # which is delocate being right: such a wheel would install on an
           # Intel Mac and then fail to exec. _PYTHON_HOST_PLATFORM is the
           # override setuptools honours for this, and is what cibuildwheel uses.
-          # 11.0 is the arm64 floor — no earlier macOS runs on Apple silicon.
+          # 14.0 matches MACOSX_DEPLOYMENT_TARGET in the build step; see there.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            export _PYTHON_HOST_PLATFORM=macosx-11.0-arm64
+            export _PYTHON_HOST_PLATFORM=macosx-14.0-arm64
             export ARCHFLAGS="-arch arm64"
           fi
 
