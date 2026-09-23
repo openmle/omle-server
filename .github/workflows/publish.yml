@@ -174,7 +174,26 @@ jobs:
           #
           # No perl here: nothing builds OpenSSL from source on this path, so
           # the Perl modules its Configure needs are not required either.
-          dnf install -y cmake ninja-build git openssl-devel libuuid-devel zlib-devel
+          # openssl3-devel, not openssl-devel.
+          #
+          # This image's openssl-devel is 1.1.1k, EOL since 2023, with soname
+          # libssl.so.1.1. Building against it produced a wheel that auditwheel
+          # then VENDORED — the --exclude flags below name libssl.so.3 and
+          # never matched — so the wheel shipped libssl-<hash>.so.1.1.1k
+          # embedded, which is exactly what the no-vendored-crypto rule exists
+          # to prevent, with a version that stopped receiving fixes years ago.
+          #
+          # EPEL's openssl3 is side-installed so it can coexist with 1.1.1:
+          # headers under /usr/include/openssl3 and the dev symlink under
+          # /usr/lib64/openssl3, which is why find_package(OpenSSL) cannot see
+          # it unaided and the build step passes explicit paths. The runtime
+          # library is in the normal place with the normal soname:
+          #
+          #   /usr/lib64/libssl.so.3 -> libssl.so.3.5.5   SONAME libssl.so.3
+          #
+          # so the binary records libssl.so.3, --exclude matches, and the
+          # user's own OpenSSL 3 resolves it at load time.
+          dnf install -y cmake ninja-build git openssl3-devel libuuid-devel zlib-devel
 
           # Put one of manylinux's own interpreters on PATH.
           #
@@ -312,6 +331,14 @@ jobs:
           if [ "${{ matrix.bundled }}" = "OFF" ]; then
             EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
             EXTRA="$EXTRA -DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
+          fi
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # EPEL's openssl3 is side-installed, so find_package(OpenSSL) does
+            # not find it and would silently fall back to the image's EOL
+            # 1.1.1k. See the toolchain step above.
+            EXTRA="$EXTRA -DOPENSSL_INCLUDE_DIR=/usr/include/openssl3"
+            EXTRA="$EXTRA -DOPENSSL_SSL_LIBRARY=/usr/lib64/openssl3/libssl.so"
+            EXTRA="$EXTRA -DOPENSSL_CRYPTO_LIBRARY=/usr/lib64/openssl3/libcrypto.so"
           fi
           cmake -S . -B build $GEN $EXTRA \
             -DCMAKE_BUILD_TYPE=Release \
@@ -503,7 +530,13 @@ jobs:
           if [ -z "$BIN" ]; then echo "::error::no binary in wheel"; exit 1; fi
           case "$RUNNER_OS" in
             macOS) REFS=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}') ;;
-            Linux) REFS=$(objdump -p "$BIN" | awk '/NEEDED|RUNPATH|RPATH/ {print $2}') ;;
+            # NEEDED only. RUNPATH/RPATH entries are $ORIGIN-relative — the
+            # loader expands them against the binary's own location, so they
+            # are not paths that exist at build time and testing them with -e
+            # always fails. auditwheel adds exactly one,
+            # $ORIGIN/../../omle_server.libs, pointing at the libraries it
+            # vendored into the wheel.
+            Linux) REFS=$(objdump -p "$BIN" | awk '/NEEDED/ {print $2}') ;;
             Windows)
               # dumpbin is the MSVC equivalent and is not on PATH outside a
               # developer prompt, so it is located under the VS install. PE
@@ -541,7 +574,9 @@ jobs:
             # Relative names resolve at load time: a bare soname on Linux, or
             # @rpath/@loader_path/@executable_path on macOS.
             case "$ref" in
-              @*|*/) continue ;;
+              # Loader-relative, resolved at run time: @rpath/@loader_path on
+              # macOS, $ORIGIN on Linux. Not testable here.
+              @*|\$ORIGIN*|*/) continue ;;
               */*) : ;;
               *) continue ;;
             esac
