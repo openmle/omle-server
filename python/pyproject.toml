@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omle-server"
 dynamic = ["version"]
-description = "OMLE inference server — OIP-compatible REST + gRPC serving"
+description = "Open Inference Protocol (OIP) server for OMLE models over REST and gRPC"
 requires-python = ">=3.10"
 readme = "README.md"
 # No Python dependencies: the payload is a statically linked executable. Its one

@@ -6,7 +6,9 @@ over both REST and gRPC.
 
 ```bash
 pip install omle-server
-omle-server                        # configs/server.json, or built-in defaults
+omle-server                        # built-in defaults
+omle-server --help                 # every flag
+omle-server --model-dir ./models --rest-port 9000
 omle-server /etc/omle/server.json  # an explicit config
 ```
 
@@ -37,18 +39,32 @@ platforms build from source — see the repository README.
 
 ## Configuring
 
-The binary reads a JSON config file, and these environment variables override
-whatever it contains:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OMLE_MODEL_DIR` | `/models` | directory scanned for `.omle` files |
-| `OMLE_REST_PORT` | `8080` | REST listen port |
-| `OMLE_GRPC_PORT` | `8081` | gRPC listen port |
+Four sources, each overriding the one above it: built-in defaults, then a JSON
+config file, then the environment, then command-line flags.
 
 ```bash
-OMLE_MODEL_DIR=./models OMLE_REST_PORT=9000 omle-server
+omle-server init-config -o server.json    # every setting, at its default
+omle-server --config server.json
 ```
+
+| Variable | Flag | Default | Meaning |
+|---|---|---|---|
+| `OMLE_CONFIG` | `--config` | `configs/server.json` | config file |
+| `OMLE_MODEL_DIR` | `--model-dir` | `/models` | directory scanned for `.omle` files |
+| `OMLE_REST_PORT` | `--rest-port` | `8080` | REST listen port |
+| `OMLE_GRPC_PORT` | `--grpc-port` | `8081` | gRPC listen port |
+| `OMLE_REST_THREADS` | `--rest-threads` | one per core | REST workers |
+| `OMLE_GRPC_THREADS` | `--grpc-threads` | one per core | gRPC workers |
+| `OMLE_MODEL_THREADS` | `--model-threads` | `1` | threads per model |
+| `OMLE_LOG_LEVEL` | `--log-level` | `info` | trace…error |
+
+```bash
+OMLE_MODEL_DIR=./models omle-server --rest-port 9000
+omle-server --help                        # the full list
+```
+
+Environment sits below flags so a container image can set a baseline that
+`docker run` still overrides.
 
 There is deliberately no Python wrapper translating arguments into these. It
 could only restate what the binary already does, and would drift from it. To

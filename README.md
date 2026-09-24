@@ -156,17 +156,55 @@ gRPC, which is why CI uses it for Windows.
 ## Running
 
 ```bash
-./build/omle_server configs/server.json
+omle-server --model-dir /path/to/models --rest-port 8080 --grpc-port 8081
+omle-server --help                     # every flag, with defaults
 ```
 
-Or with environment variable overrides:
+Nothing has to exist first: with no config file and no flags the built-in
+defaults start a server on 8080/8081 reading `/models`.
+
+### Configuration precedence
+
+Four sources, each overriding the one above it:
+
+| | source | example |
+|---|---|---|
+| 1 | built-in defaults | `rest_port` 8080 |
+| 2 | config file | `--config server.json`, else `configs/server.json` |
+| 3 | environment | `OMLE_REST_PORT=9000` |
+| 4 | command-line flags | `--rest-port 9000` |
+
+Environment sits below flags so a container image can set a baseline that
+`docker run` still overrides, without rewriting the config file.
 
 ```bash
-OMLE_MODEL_DIR=/path/to/models \
-OMLE_REST_PORT=8080 \
-OMLE_GRPC_PORT=8081 \
-./build/omle_server
+# start from the defaults, then edit to taste
+omle-server init-config -o server.json
+omle-server --config server.json
+
+# or skip the file entirely
+OMLE_MODEL_DIR=/models omle-server --rest-port 9000
 ```
+
+`init-config` writes every setting with its default value, generated from the
+same struct the loader reads back, so it cannot drift from the code. It refuses
+to clobber an existing file unless given `--force`.
+
+A bare config path — `omle-server server.json` — still works, as the first
+release accepted it, but `--config` is the documented spelling.
+
+### Environment variables
+
+| variable | equivalent flag |
+|---|---|
+| `OMLE_CONFIG` | `--config` |
+| `OMLE_MODEL_DIR` | `--model-dir` |
+| `OMLE_REST_PORT` | `--rest-port` |
+| `OMLE_GRPC_PORT` | `--grpc-port` |
+| `OMLE_REST_THREADS` | `--rest-threads` |
+| `OMLE_GRPC_THREADS` | `--grpc-threads` |
+| `OMLE_MODEL_THREADS` | `--model-threads` |
+| `OMLE_LOG_LEVEL` | `--log-level` |
 
 ### Example REST inference
 
