@@ -77,8 +77,8 @@ permissions:
 #
 # Bump these when omle-runtime or omle cuts a release that this one needs.
 env:
-  OMLE_RUNTIME_REF: v0.1.0-rc9
-  OMLE_REF: v0.1.1-rc1
+  OMLE_RUNTIME_REF: v0.1.0
+  OMLE_REF: v0.1.1
 
 jobs:
   # ---------------------------------------------------------------------------
