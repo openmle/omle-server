@@ -1,4 +1,4 @@
-# omle-server
+# OMLE Server
 
 High-performance C++ inference server for OMLE models.  Implements the
 [Open Inference Protocol](https://github.com/kserve/open-inference-protocol)
@@ -6,6 +6,27 @@ High-performance C++ inference server for OMLE models.  Implements the
 
 Built on top of **omle-runtime** for model execution,
 **Drogon** for the REST layer, and the **gRPC C++** library for the gRPC layer.
+
+---
+
+## Installation
+
+```bash
+pip install omle-server
+omle-server                        # configs/server.json, or built-in defaults
+```
+
+The wheel carries a statically linked executable — gRPC, Abseil, protobuf,
+Drogon, jsoncpp, simdjson and the OMLE runtime are all inside it.
+
+**OpenSSL 3 must be present on the system.** It is the one library deliberately
+left dynamic: bundling it would freeze a cryptographic library at build time,
+cut off from the operating system's security updates and patchable only by
+cutting a new release. Every current distribution ships it (`libssl3` on
+Debian/Ubuntu, `openssl-libs` on Fedora/RHEL, `openssl@3` on Homebrew).
+
+Wheels cover linux-x86_64, linux-aarch64 and macos-arm64; anything else builds
+from source.
 
 ---
 
@@ -85,7 +106,22 @@ Two conventions are supported:
 # macOS
 brew install drogon nlohmann-json simdjson
 conda install -c conda-forge grpc-cpp   # or via conda base env
+
+# Ubuntu — the long tail is Drogon's, not this project's. Ubuntu builds
+# libdrogon-dev with ORM support, so its CMake config insists on PostgreSQL,
+# SQLite, MySQL, Boost, Hiredis and yaml-cpp headers even though the server
+# touches no database. libmariadb-dev-compat supplies the mysql_config script
+# that Drogon's FindMySQL looks for; default-libmysqlclient-dev does not.
+apt install libdrogon-dev libjsoncpp-dev uuid-dev zlib1g-dev \
+            libpq-dev libsqlite3-dev libmariadb-dev libmariadb-dev-compat \
+            libhiredis-dev libyaml-cpp-dev libboost-dev libbrotli-dev \
+            libgrpc++-dev protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
+            libgtest-dev libsimdjson-dev nlohmann-json3-dev
 ```
+
+If that list is unwelcome, `-DOMLE_SERVER_BUNDLE_DEPS=ON` builds every
+dependency from pinned source and needs only `libssl-dev` and `uuid-dev` — at
+the cost of a much longer build. See *Self-contained build* below.
 
 ### Build
 
@@ -98,22 +134,77 @@ cmake --build . --parallel $(nproc)
 The build will also compile **omle-runtime** from the sibling directory
 `../omle-runtime` automatically.
 
+### Self-contained build
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOMLE_SERVER_BUNDLE_DEPS=ON
+cmake --build build --target omle_server
+```
+
+Compiles every dependency from pinned source and links them statically, which
+is how the published wheels are built. It takes considerably longer — gRPC and
+its submodules are built from scratch — and produces one ~25 MB executable that
+can be copied to a machine with nothing installed but a C++ runtime and
+OpenSSL. A default build links 112 shared libraries, 79 of them Abseil, and so
+only runs where all of them are present at matching versions.
+
+It is also the only way to build where no package manager supplies Drogon and
+gRPC, which is why CI uses it for Windows.
+
 ---
 
 ## Running
 
 ```bash
-./build/omle_server configs/server.json
+omle-server --model-dir /path/to/models --rest-port 8080 --grpc-port 8081
+omle-server --help                     # every flag, with defaults
 ```
 
-Or with environment variable overrides:
+Nothing has to exist first: with no config file and no flags the built-in
+defaults start a server on 8080/8081 reading `/models`.
+
+### Configuration precedence
+
+Four sources, each overriding the one above it:
+
+| | source | example |
+|---|---|---|
+| 1 | built-in defaults | `rest_port` 8080 |
+| 2 | config file | `--config server.json`, else `configs/server.json` |
+| 3 | environment | `OMLE_REST_PORT=9000` |
+| 4 | command-line flags | `--rest-port 9000` |
+
+Environment sits below flags so a container image can set a baseline that
+`docker run` still overrides, without rewriting the config file.
 
 ```bash
-OMLE_MODEL_DIR=/path/to/models \
-OMLE_REST_PORT=8080 \
-OMLE_GRPC_PORT=8081 \
-./build/omle_server
+# start from the defaults, then edit to taste
+omle-server init-config -o server.json
+omle-server --config server.json
+
+# or skip the file entirely
+OMLE_MODEL_DIR=/models omle-server --rest-port 9000
 ```
+
+`init-config` writes every setting with its default value, generated from the
+same struct the loader reads back, so it cannot drift from the code. It refuses
+to clobber an existing file unless given `--force`.
+
+A bare config path — `omle-server server.json` — still works, as the first
+release accepted it, but `--config` is the documented spelling.
+
+### Environment variables
+
+| variable | equivalent flag |
+|---|---|
+| `OMLE_CONFIG` | `--config` |
+| `OMLE_MODEL_DIR` | `--model-dir` |
+| `OMLE_REST_PORT` | `--rest-port` |
+| `OMLE_GRPC_PORT` | `--grpc-port` |
+| `OMLE_REST_THREADS` | `--rest-threads` |
+| `OMLE_GRPC_THREADS` | `--grpc-threads` |
+| `OMLE_MODEL_THREADS` | `--model-threads` |
+| `OMLE_LOG_LEVEL` | `--log-level` |
 
 ### Example REST inference
 

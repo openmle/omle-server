@@ -1,6 +1,11 @@
 # cmake/bundled_deps.cmake — build every dependency from pinned source as a
 # static archive, so the server links into one self-contained executable.
 #
+# Scope: only libraries the shipped executable links. A test-only dependency
+# has no business here — it never reaches the binary, and fetching it would tie
+# "make the artifact self-contained" to "run the test suite", which are
+# unrelated. GoogleTest is fetched by tests/CMakeLists.txt instead.
+#
 # Enabled by -DOMLE_SERVER_BUNDLE_DEPS=ON. Off by default because this is a
 # long build: gRPC alone carries Abseil, protobuf, BoringSSL, re2, c-ares and
 # zlib as submodules, and all of them are compiled here.
@@ -33,6 +38,14 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 
+# Nothing here is ever installed — the dependencies are linked into one
+# executable and that binary is copied where it is needed. Leaving their
+# install rules defined is not merely dead weight: Drogon exports a
+# DrogonTargets set, and once ZLIB::ZLIB points at gRPC's zlibstatic (below)
+# CMake refuses to generate, because an exported target may not depend on one
+# outside any export set.
+set(CMAKE_SKIP_INSTALL_RULES ON)
+
 # ── gRPC (brings protobuf, Abseil, BoringSSL, re2, c-ares, zlib) ─────────────
 # Pinned to the version the unbundled build was developed against, so switching
 # modes does not silently change the wire implementation.
@@ -55,7 +68,13 @@ set(gRPC_BUILD_GRPC_CSHARP_PLUGIN       OFF CACHE BOOL "" FORCE)
 # system copies — which is the entire point of this file.
 set(gRPC_ABSL_PROVIDER      "module" CACHE STRING "" FORCE)
 set(gRPC_PROTOBUF_PROVIDER  "module" CACHE STRING "" FORCE)
-set(gRPC_SSL_PROVIDER       "module" CACHE STRING "" FORCE)
+# "package", not "module": module builds BoringSSL, and Drogon links the
+# system OpenSSL, so both end up in one link defining ERR_get_error_line,
+# X509_STORE_CTX_get_error and friends — hundreds of duplicate symbols. One
+# SSL implementation has to win, and it is OpenSSL, because that is the one
+# the operating system keeps patched. This is the same reason OpenSSL is left
+# out of the published wheel.
+set(gRPC_SSL_PROVIDER       "package" CACHE STRING "" FORCE)
 set(gRPC_ZLIB_PROVIDER      "module" CACHE STRING "" FORCE)
 set(gRPC_CARES_PROVIDER     "module" CACHE STRING "" FORCE)
 set(gRPC_RE2_PROVIDER       "module" CACHE STRING "" FORCE)
@@ -87,6 +106,29 @@ set(Protobuf_VERSION           "bundled with gRPC ${OMLE_GRPC_VERSION}"      CAC
 # The proto rule in the top-level CMakeLists looks this up; with a vendored
 # build it is a target rather than something on PATH.
 set(GRPC_CPP_PLUGIN_EXECUTABLE "$<TARGET_FILE:grpc_cpp_plugin>" CACHE STRING "" FORCE)
+
+# ── zlib: hand Drogon the copy gRPC just built ──────────────────────────────
+# Drogon does find_package(ZLIB REQUIRED) and links ZLIB::ZLIB. gRPC compiled
+# zlib as a submodule, but FindZLIB only searches the system, so on a machine
+# with no system zlib — any Windows runner — the configure fails outright.
+#
+# FindZLIB skips creating ZLIB::ZLIB when the target already exists, so the
+# alias below wins. The two cache variables exist purely so that
+# find_package_handle_standard_args sees non-empty values and reports success;
+# nothing reads them once ZLIB::ZLIB resolves.
+#
+# The include path needs both directories: zlib.h is in the source tree while
+# zconf.h is generated into the build tree.
+foreach(_zlib_tgt zlibstatic zlib)
+    if(TARGET ${_zlib_tgt} AND NOT TARGET ZLIB::ZLIB)
+        add_library(ZLIB::ZLIB ALIAS ${_zlib_tgt})
+        set(ZLIB_LIBRARY ${_zlib_tgt} CACHE STRING "" FORCE)
+        set(ZLIB_INCLUDE_DIR
+            "${grpc_SOURCE_DIR}/third_party/zlib;${grpc_BINARY_DIR}/third_party/zlib"
+            CACHE STRING "" FORCE)
+        message(STATUS "  zlib: using gRPC's ${_zlib_tgt}")
+    endif()
+endforeach()
 
 # ── jsoncpp ─────────────────────────────────────────────────────────────────
 # Drogon requires jsoncpp and has no vendoring option of its own, so it is
@@ -144,6 +186,43 @@ set(BUILD_C-ARES      OFF CACHE BOOL "" FORCE)
 # vendored BoringSSL is not a drop-in replacement, so dropping it would mean
 # giving up HTTPS rather than just shedding a dependency. libssl/libcrypto
 # therefore remain external; see the README on what that means for deployment.
+
+# Resolve UUID ourselves, before Drogon can fail to.
+#
+# USE_STATIC_LIBS_ONLY above makes Drogon narrow CMAKE_FIND_LIBRARY_SUFFIXES to
+# .a for the rest of its configure, and its find_package(UUID) then searches
+# only for libuuid.a. No mainstream distribution ships one — libuuid-devel on
+# AlmaLinux, Debian and Ubuntu carries libuuid.so alone — so configure dies
+# with "Could not find UUID" on a machine where UUID is plainly installed.
+#
+# macOS never hit this: Drogon's FindUUID.cmake accepts an empty library on
+# Apple and BSD, so only Linux fails, which is why the bundled macOS build
+# passed while the manylinux wheel did not.
+#
+# FindUUID.cmake short-circuits when both cache variables are already set, so
+# finding them here with the normal suffixes skips its restricted search
+# entirely. The spellings mirror what it would have produced: the library by
+# plain name, and the directory *containing* uuid.h — Drogon's Utilities.cc
+# includes <uuid.h>, not <uuid/uuid.h>.
+#
+# libuuid stays a shared system library, like libssl. It is part of util-linux
+# and present everywhere; absorbing it would gain nothing.
+if(UNIX AND NOT APPLE)
+    find_library(OMLE_UUID_LIBRARY NAMES uuid)
+    find_path(OMLE_UUID_INCLUDE_DIR NAMES uuid.h PATH_SUFFIXES uuid)
+    if(OMLE_UUID_LIBRARY AND OMLE_UUID_INCLUDE_DIR)
+        set(UUID_LIBRARIES    "${OMLE_UUID_LIBRARY}"     CACHE STRING "" FORCE)
+        set(UUID_INCLUDE_DIRS "${OMLE_UUID_INCLUDE_DIR}" CACHE STRING "" FORCE)
+        message(STATUS "UUID (system)      : ${UUID_LIBRARIES}")
+    else()
+        message(FATAL_ERROR
+            "libuuid not found. Install it before configuring: "
+            "uuid-dev on Debian/Ubuntu, libuuid-devel on RHEL/Alma/Fedora. "
+            "Drogon requires it and its own search cannot see a shared one "
+            "once USE_STATIC_LIBS_ONLY narrows the library suffixes.")
+    endif()
+endif()
+
 FetchContent_Declare(drogon
     GIT_REPOSITORY https://github.com/drogonframework/drogon.git
     GIT_TAG        ${OMLE_DROGON_VERSION}
@@ -169,25 +248,6 @@ FetchContent_Declare(nlohmann_json
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
-# ── GoogleTest (only when the C++ tests are being built) ────────────────────
-# tests/CMakeLists.txt calls find_package(GTest REQUIRED). That works where a
-# package manager supplies it, but a bundled build is by definition running
-# somewhere that has no system packages — Windows most of all. Fetching it here
-# keeps `-DBUILD_SERVER_TESTS=ON -DOMLE_SERVER_BUNDLE_DEPS=ON` a working
-# combination on every platform.
-if(BUILD_SERVER_TESTS)
-    # GoogleTest defaults to linking the shared CRT on MSVC while everything
-    # else here is static; mismatching those is a link error, not a warning.
-    set(gtest_force_shared_crt OFF CACHE BOOL "" FORCE)
-    set(INSTALL_GTEST          OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(googletest
-        GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG        v1.15.2
-        GIT_SHALLOW    TRUE
-    )
-    FetchContent_MakeAvailable(googletest)
-endif()
-
 # ── Namespaced aliases ──────────────────────────────────────────────────────
 # find_package() defines Drogon::Drogon, gRPC::grpc++ and friends from each
 # project's installed config file. Built as subprojects they define the bare
@@ -198,11 +258,7 @@ foreach(_pair "Drogon::Drogon=drogon"
               "gRPC::grpc++=grpc++"
               "gRPC::grpc=grpc"
               "simdjson::simdjson=simdjson"
-              "nlohmann_json::nlohmann_json=nlohmann_json"
-              "GTest::GTest=gtest"
-              "GTest::Main=gtest_main"
-              "GTest::gtest=gtest"
-              "GTest::gtest_main=gtest_main")
+              "nlohmann_json::nlohmann_json=nlohmann_json")
     string(REPLACE "=" ";" _parts "${_pair}")
     list(GET _parts 0 _alias)
     list(GET _parts 1 _real)

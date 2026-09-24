@@ -157,11 +157,18 @@ class ServerEnvironment : public ::testing::Environment {
     g_model_dir = fs::temp_directory_path() / "omle_integ_test";
     fs::create_directories(g_model_dir);
 
+    // Hard failure, not a silent skip. Without the model the server still
+    // starts and answers /v2/health/*, so the suite used to report 24 failing
+    // tests with 503s and no mention of the file that was never copied.
     const std::string src = TEST_MODEL_SRC_PATH;
-    if (!src.empty() && fs::exists(src)) {
-      fs::copy_file(src, g_model_dir / (MODEL_NAME + ".omle"),
-                    fs::copy_options::overwrite_existing);
-    }
+    ASSERT_FALSE(src.empty()) << "TEST_MODEL_SRC_PATH is empty — the CMake "
+                                 "cache variable TEST_MODEL_SRC is unset";
+    ASSERT_TRUE(fs::exists(src))
+        << "Test model not found: " << src
+        << "\nThe integration test needs it in the model directory; every "
+           "model-dependent test returns 503 without it.";
+    fs::copy_file(src, g_model_dir / (MODEL_NAME + ".omle"),
+                  fs::copy_options::overwrite_existing);
 
     // Fork + exec the server.
     pid_t pid = ::fork();

@@ -9,6 +9,26 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Any translation unit that pulls in <windows.h> gets min and max as
+# function-like macros unless NOMINMAX is set. gRPC's headers are what surface
+# this: grpc/event_engine/memory_request.h declares
+#
+#     size_t min() const { return min_; }
+#
+# and `min()` with no arguments does not expand, so MSVC reports
+# "C2059: syntax error: ')'" inside a gRPC header that is perfectly valid.
+# The parse then derails mid-namespace and grpc_event_engine is never closed,
+# so every later include lands inside it — which is why the follow-on errors
+# name types like grpc_event_engine::absl::lts_20260107::Status and look like
+# an Abseil problem rather than a preprocessor one.
+#
+# Set before add_subdirectory below so the tests inherit it too. omle-runtime's
+# CMakeLists sets the same pair for its own targets; directory scope does not
+# carry upward, so this is not redundant.
+if(MSVC)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # -march=native is deliberately absent: it bakes the build machine's ISA into
 # the binary, so a server image built on one host can fault on another. There is
 # no hand-written SIMD in this project to keep alive either -- the intrinsics
@@ -104,13 +124,21 @@ target_include_directories(omle_server PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
-# omle_runtime_static vs omle_runtime: the latter is the SHARED library, which
-# would leave libomleruntime.dylib next to the binary and defeat the point.
-if(OMLE_SERVER_BUNDLE_DEPS)
-    set(OMLE_RUNTIME_LINK_TARGET omle_runtime_static)
-else()
-    set(OMLE_RUNTIME_LINK_TARGET omle_runtime)
-endif()
+# omle_runtime_static, always. omle-runtime defines both an `omle_runtime`
+# SHARED and an `omle_runtime_static` STATIC target; linking the former leaves
+# a libomleruntime.dylib/.so that has to travel beside the executable, which
+# defeats the point of shipping one self-contained binary.
+#
+# This used to be conditional on OMLE_SERVER_BUNDLE_DEPS, which was right while
+# bundling was the only way to get a self-contained build. It is not any more:
+# the Conan rows link prebuilt static archives with BUNDLE_DEPS=OFF and are
+# just as self-contained, but took the shared branch and produced a binary
+# carrying @rpath/libomleruntime.dylib — caught by publish.yml's "links nothing
+# it should have absorbed" assert.
+#
+# Where the dependencies come from and how omle-runtime is linked are separate
+# questions, so they no longer share a condition.
+set(OMLE_RUNTIME_LINK_TARGET omle_runtime_static)
 
 target_link_libraries(omle_server PRIVATE
     ${OMLE_RUNTIME_LINK_TARGET}

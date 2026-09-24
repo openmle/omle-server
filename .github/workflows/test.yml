@@ -45,23 +45,48 @@ jobs:
   # Build, then the C++ unit tests and the Python REST/gRPC integration tests.
   # ---------------------------------------------------------------------------
   build-and-test:
-    name: Build and test (${{ matrix.os }})
+    name: Build and test (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Every row builds what publish.yml ships, so no released
+          # configuration goes untested and no tested one is unreleased.
+          #
+          # Every row takes its dependencies from ConanCenter as prebuilt
+          # static archives. That is not a different kind of build:
+          # ConanCenter's default is shared=False, so the executable is linked
+          # from the same static libraries cmake/bundled_deps.cmake would
+          # produce, without compiling gRPC's submodule tree to get them.
+          # Linux is bundled, matching publish.yml — and it has to be there,
+          # so it is here too. ConanCenter's Linux binaries are built with
+          # gcc 13 and need GLIBCXX_3.4.32, which no manylinux image provides
+          # (2_28 has 3.4.25; 2_34 has 3.4.29), so the wheel cannot be built
+          # with them. Testing the Conan path here while shipping the bundled
+          # one would leave the released configuration untested.
           - os: ubuntu-latest
-            bundled: "OFF"
-          - os: macos-latest
-            bundled: "OFF"
-          # Windows has no apt/brew to supply Drogon, gRPC, jsoncpp or GTest,
-          # so it builds every dependency from source instead. That is far
-          # slower than the other two rows — it compiles gRPC and its
-          # submodules — but it is the only way to build here at all, and it
-          # exercises the same path the published wheels use.
-          - os: windows-latest
             bundled: "ON"
+            profile: ""
+            conan_build: ""
+            label: ubuntu x86_64 / bundled
+          # macOS is bundled so the wheel matches omle-runtime's reach.
+          # ConanCenter's macOS arm64 binaries are all built with minos 14.0,
+          # so anything linking them inherits a macOS 14 floor, while
+          # omle-runtime — which builds its dependencies from source — ships
+          # macosx_11_0_arm64. Building from source here buys back macOS 11,
+          # 12 and 13 at the cost of compile time.
+          - os: macos-latest
+            bundled: "ON"
+            profile: ""
+            conan_build: ""
+            label: macOS arm64 / bundled
+          - os: windows-latest
+            bundled: "OFF"
+            profile: windows-msvc
+            conan_build: never
+            label: windows / conan
+
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -82,27 +107,111 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Drogon, gRPC, protobuf and GTest are found with find_package and are not
-      # vendored, so they have to exist before configure. simdjson and
-      # nlohmann/json fall back to FetchContent when absent (see
-      # cmake/deps.cmake), but installing them keeps the build off the network.
-      - name: Install dependencies (Linux)
+      # Only the toolchain and the three libraries the bundled build still
+      # resolves against the system. gRPC, Abseil, protobuf, Drogon, jsoncpp
+      # and simdjson must NOT be installed: cmake/bundled_deps.cmake compiles
+      # them from pinned source, and finding a system copy instead is the
+      # silent failure this row exists to catch. publish.yml's manylinux step
+      # installs the same three and nothing more.
+      #
+      # libssl is external by design — a vendored copy stops receiving the
+      # distribution's security updates. uuid and zlib are Drogon's: its own
+      # CMakeLists calls find_package(UUID REQUIRED) and find_package(ZLIB
+      # REQUIRED) on Linux even when built from source.
+      # Linux builds its dependencies from pinned source, so only the
+      # toolchain and the three libraries that build still resolves against
+      # the system. gRPC, Drogon, protobuf, Abseil, jsoncpp and simdjson must
+      # NOT be installed: finding a system copy is the failure the bundled
+      # build exists to prevent. OpenSSL stays external by design, and Drogon
+      # calls find_package on UUID and ZLIB even when built from source.
+      - name: Install the toolchain (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build \
-            libdrogon-dev \
-            libgrpc++-dev protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
-            libgtest-dev \
-            libsimdjson-dev nlohmann-json3-dev
+            cmake ninja-build libssl-dev uuid-dev zlib1g-dev
 
-      - name: Install dependencies (macOS)
+      - name: Install the toolchain (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake ninja drogon grpc protobuf googletest simdjson nlohmann-json
+        run: brew install cmake ninja openssl@3
 
-      # Nothing to install on Windows: cmake and ninja ship with the runner
-      # image, and every library comes from cmake/bundled_deps.cmake.
+      - name: Cache the Conan package cache
+        if: matrix.bundled == 'OFF'
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ matrix.profile }}-${{ hashFiles('omle-server/conanfile.txt', format('omle-server/conan/profiles/{0}', matrix.profile)) }}
+
+      - name: Install dependencies (Conan)
+        if: matrix.bundled == 'OFF'
+        working-directory: omle-server
+        shell: bash
+        run: |
+          python3 -m pip install conan
+
+          # -pr:a, not `conan profile detect`, and not -s flags.
+          #
+          # :a applies the profile to the host *and* build contexts.
+          # [tool_requires] resolves in the build context, and settings passed
+          # with -s reach only the host, so a detected build profile kept
+          # cppstd=14 and protobuf and gRPC — which require 17 — were rejected
+          # outright: "Invalid: Current cppstd (14) is lower than the required
+          # C++ standard (17)". The host context failed more quietly, every
+          # package "Missing", because a profile differing in any setting
+          # yields package_ids nothing was ever built for.
+          #
+          # --build=never on the rows where nothing should need building, so a
+          # miss fails here in seconds naming the package rather than silently
+          # compiling gRPC from source and going green forty minutes later.
+          conan install . \
+            --output-folder=build/conan \
+            --build=${{ matrix.conan_build }} \
+            -pr:a=conan/profiles/${{ matrix.profile }}
+
+          # --build=missing is necessary here (OpenSSL has no prebuilt shared
+          # variant) but it is also silent: if the runner's compiler ever stops
+          # matching the profile, every package_id changes and Conan quietly
+          # compiles the whole graph — gRPC, Abseil, protobuf, boost — turning a
+          # three-minute job into an hour-long one that still passes.
+          #
+          # So the expensive packages are asserted to have come prebuilt. This
+          # fails in seconds with the resolved profile in the log, which is what
+          # you need to see to fix the pin.
+          # A relative path, not /tmp: this step runs under bash on every
+          # platform, but the heredoc below is interpreted by native Windows
+          # Python, which reads an absolute "/tmp/..." as C:\tmp\... and not
+          # as git-bash's /tmp. The redirect succeeded and the open() failed.
+          conan graph info . -pr:a=conan/profiles/${{ matrix.profile }} \
+            --format=json > build/conan-graph.json
+          python3 - <<'PYEOF'
+          import json
+          g = json.load(open("build/conan-graph.json"))
+          prebuilt = {"Download", "Cache", "Skip", "Platform"}
+          expensive = {"grpc", "protobuf", "abseil", "drogon", "boost"}
+          built = sorted({n.get("name") for n in g["graph"]["nodes"].values()
+                          if n.get("binary") and n["binary"] not in prebuilt
+                          and n.get("name") in expensive})
+          if built:
+              raise SystemExit(
+                  f"::error::{built} would be built from source. The profile no "
+                  "longer matches what ConanCenter publishes — check the "
+                  "compiler version and cppstd above against conan/profiles/.")
+          print("expensive packages all prebuilt")
+          PYEOF
+
+      # The bundled rows fetch gRPC, Drogon, jsoncpp and simdjson from pinned
+      # source. Cloning gRPC's submodule tree — Abseil, protobuf, BoringSSL,
+      # re2, c-ares — dominates that work; it is the clone, not the compile.
+      # So this cache is what makes the bundled path affordable on every push.
+      #
+      # Keyed on bundled_deps.cmake, so bumping a pin there invalidates it and
+      # nothing else does.
+      - name: Cache fetched dependency sources
+        if: matrix.bundled == 'ON'
+        uses: actions/cache@v4
+        with:
+          path: omle-server/build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('omle-server/cmake/bundled_deps.cmake') }}
 
       - name: Configure
         working-directory: omle-server
@@ -111,7 +220,54 @@ jobs:
         # build without this; a run that forgot it would look green having
         # compiled no test at all.
         run: |
-          cmake -S . -B build -G Ninja \
+          # No -G on Windows. CMake then defaults to the Visual Studio
+          # generator and builds with MSVC, which is what omle-runtime's
+          # Windows wheels and jar are built with. Forcing -G Ninja instead
+          # picks up whatever compiler is first on PATH — on the runner image
+          # that is MinGW GCC, giving a binary with a different C++ runtime
+          # than every other Windows artifact in the project.
+          #
+          # Visual Studio is a multi-config generator, so the build and test
+          # steps pass --config / --build-config rather than relying on
+          # CMAKE_BUILD_TYPE.
+          GEN="-G Ninja"
+          EXTRA=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GEN=""
+          fi
+          # macOS: pin the deployment target, or the wheel is stamped with the
+          # runner's OS version.
+          #
+          # Left unset, the compiler targets the build machine, and the runner
+          # is macOS 26. delocate derives the wheel's minimum OS from the
+          # binary, so 0.1.0rc5 shipped as
+          #
+          #   omle_server-0.1.0rc5-py3-none-macosx_26_0_arm64.whl
+          #
+          # installable only on macOS 26+. On anything older pip reports
+          # "Could not find a version that satisfies the requirement" — the
+          # project is found, no distribution matches.
+          #
+          # 11.0 matches omle-runtime, which ships macosx_11_0_arm64. It is
+          # reachable only because this row builds its dependencies from
+          # source; ConanCenter's macOS binaries carry minos 14.0 and would
+          # force a macOS 14 floor. 11.0 is the arm64 floor — no earlier macOS
+          # runs on Apple silicon.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export MACOSX_DEPLOYMENT_TARGET=11.0
+          fi
+          # Every Conan row, not just Windows: the generated toolchain is what
+          # points find_package at the downloaded packages.
+          if [ "${{ matrix.bundled }}" = "OFF" ]; then
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
+            # CMP0091 NEW is what lets the toolchain set the MSVC runtime
+            # through CMAKE_MSVC_RUNTIME_LIBRARY; without it the flag is baked
+            # into CMAKE_CXX_FLAGS instead and Conan's setting is ignored,
+            # giving a runtime mismatch against the downloaded binaries. It is
+            # a no-op off Windows.
+            EXTRA="$EXTRA -DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
+          fi
+          cmake -S . -B build $GEN $EXTRA \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SERVER_TESTS=ON \
             -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
@@ -121,7 +277,9 @@ jobs:
         shell: bash
         # The default target, not just omle_server: the test executables are
         # separate targets and `--target omle_server` would skip them.
-        run: cmake --build build -j 4
+        # --config is required by the Visual Studio generator and ignored by
+        # Ninja, so one line serves both.
+        run: cmake --build build --config Release -j 4
 
       - name: Assert the binary landed where the tests look for it
         working-directory: omle-server
@@ -130,20 +288,31 @@ jobs:
         # without this check a build that produced nothing would report a green
         # run with every integration test silently skipped.
         run: |
+          # Both layouts are checked because both occur: Ninja writes to
+          # build/, while the Visual Studio generator is multi-config and
+          # writes to build/Release/. conftest.py searches the same pair.
+          #
           # if/fi rather than `[ ... ] && BIN=...`: the runner runs bash with
           # `set -e`, so a false test at the end of an && chain would exit
           # non-zero and fail this step on every non-Windows row.
           if [ "$RUNNER_OS" = "Windows" ]; then
-            BIN=build/omle_server.exe
+            NAME=omle_server.exe
           else
-            BIN=build/omle_server
+            NAME=omle_server
           fi
-          test -f "$BIN" || { echo "::error::$BIN missing"; exit 1; }
-          echo "$BIN present"
+          FOUND=""
+          for c in "build/$NAME" "build/Release/$NAME"; do
+            if [ -f "$c" ]; then FOUND="$c"; break; fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::no $NAME in build/ or build/Release/"
+            exit 1
+          fi
+          echo "$FOUND present"
 
       - name: C++ unit tests
         working-directory: omle-server/build
-        run: ctest --output-on-failure
+        run: ctest --output-on-failure --build-config Release
 
       - name: Install the Python test dependencies
         working-directory: omle-server/python

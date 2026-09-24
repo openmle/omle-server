@@ -10,21 +10,49 @@ name: Publish omle-server
 #     CPython ABI; omle_server is exec'd by a console script, so `py3-none-<plat>`
 #     serves every supported Python. Three wheels here versus twenty there.
 #
-#   * Every wheel is built with OMLE_SERVER_BUNDLE_DEPS=ON. Without it the
-#     binary needs gRPC, Abseil, protobuf and Drogon installed at matching
-#     versions — 112 shared libraries — which is not something a `pip install`
-#     can arrange. The bundled build links all of them statically and leaves
-#     only OpenSSL, jsoncpp and system libraries external.
+#   * The Linux and macOS wheels are built with OMLE_SERVER_BUNDLE_DEPS=ON.
+#     Without it the binary needs gRPC, Abseil, protobuf and Drogon installed
+#     at matching versions — 112 shared libraries — which is not something a
+#     `pip install` can arrange. The bundled build links all of them statically
+#     and leaves only OpenSSL and system libraries external. Windows reaches
+#     the same end by a different route; see the note below.
+#
+#   * OpenSSL is deliberately NOT vendored into the wheel. A bundled libssl
+#     stops receiving the distribution's security updates and can only be
+#     patched by cutting a new release, so the wheel links the system copy and
+#     the repair steps below exclude it. Installing needs OpenSSL 3 present:
+#     it is part of every current distribution and of the macOS Homebrew
+#     baseline, so this is a dependency to declare, not to carry.
 #
 #   * Linux wheels are built inside the manylinux_2_28 image. A wheel built on
 #     the bare runner would be tagged for that runner's glibc (2.39 on
 #     ubuntu-latest), which PyPI rejects and almost no deployment target
 #     matches. This is the same baseline omle-runtime's wheels use.
 #
-# Platforms match omle-runtime's wheel matrix apart from Windows: the code
-# anticipates it (MSVC flags, omle_server.exe) but cmake/deps.cmake documents
-# only Homebrew and apt, and nobody has built it there. Adding a windows row
-# before that is verified would only produce a red release.
+# Every row takes its dependencies from ConanCenter rather than building them.
+# Its default is shared=False, so those are the same static archives
+# cmake/bundled_deps.cmake would produce, linked into the same self-contained
+# executable without compiling gRPC's submodule tree to get them. See
+# conanfile.txt and conan/profiles/.
+#
+# OpenSSL is the exception, and stays dynamic on every platform that has a
+# system copy: the Linux and macOS profiles declare it platform-provided, so
+# Conan neither downloads nor ships it and the binary links the system library
+# — which is what the --exclude flags below keep out of the wheel, and what
+# keeps a crypto library out of a release-only patch cycle. Windows has no
+# system OpenSSL, so there it is statically linked and that one wheel does
+# carry crypto frozen at build time.
+#
+# Homebrew and conda were evaluated as sources of prebuilt static libraries and
+# neither works: Homebrew ships gRPC, Drogon, Abseil and jsoncpp as shared
+# libraries with no .a at all, and conda-forge has no Drogon on any channel.
+#
+# Linux aarch64 is not built. ConanCenter publishes no aarch64 Linux binaries
+# for any of these packages, so that row would have had to compile all of them
+# from source. Anyone on aarch64 installs from source instead.
+#
+# Note that with no bundled row left, cmake/bundled_deps.cmake is no longer
+# exercised by CI on any platform, here or in test.yml.
 
 on:
   workflow_dispatch:
@@ -40,6 +68,18 @@ on:
 permissions:
   contents: read
 
+# The sibling repositories are pinned, not taken from their default branches.
+# A release built against a moving dependency is not reproducible: rebuilding
+# this same tag later could link a different omle-runtime and produce a
+# different binary under an identical version number. test.yml deliberately
+# stays on the default branches — catching a sibling's breaking change early is
+# the point there — but a published artifact has to name what went into it.
+#
+# Bump these when omle-runtime or omle cuts a release that this one needs.
+env:
+  OMLE_RUNTIME_REF: v0.1.0
+  OMLE_REF: v0.1.1
+
 jobs:
   # ---------------------------------------------------------------------------
   # 1. One self-contained wheel per platform.
@@ -52,19 +92,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The one bundled row, and it has to be.
+          #
+          # ConanCenter builds its Linux binaries with gcc 13, so they require
+          # GLIBCXX_3.4.32 and GLIBC_2.34. No manylinux image provides the
+          # former: 2_28 has GLIBCXX_3.4.25, and even 2_34 — which does have
+          # glibc 2.34 — ships only libstdc++.so.6.0.29 (GLIBCXX_3.4.29),
+          # because Red Hat holds the runtime at that version for ABI
+          # stability while shipping gcc 14. Conan's protoc will not exec
+          # there, and its static libraries would embed 3.4.32 references into
+          # omle_server itself, so auditwheel would reject the wheel anyway.
+          #
+          # Building the dependencies from pinned source against the old glibc
+          # is exactly what manylinux exists for.
           - os: ubuntu-latest
             target: linux-x86_64
             container: quay.io/pypa/manylinux_2_28_x86_64
-          # Free arm64 Linux runners are public-repository only; drop this row
-          # if that does not apply, at the cost of aarch64 wheels.
-          - os: ubuntu-24.04-arm
-            target: linux-aarch64
-            container: quay.io/pypa/manylinux_2_28_aarch64
+            bundled: "ON"
+            profile: ""
+            conan_build: ""
           # Apple silicon only, matching omle-runtime. An Intel Mac builds from
           # source.
+          # Bundled, to match omle-runtime's macosx_11_0_arm64 reach.
+          # ConanCenter's macOS arm64 binaries carry minos 14.0, which would
+          # force a macOS 14 floor on every wheel linking them.
           - os: macos-latest
             target: macos-arm64
             container: ""
+            bundled: "ON"
+            profile: ""
+            conan_build: ""
+          - os: windows-latest
+            target: windows-x86_64
+            container: ""
+            bundled: "OFF"
+            profile: windows-msvc
+            conan_build: never
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -76,11 +139,13 @@ jobs:
       - uses: actions/checkout@v4.2.2
         with:
           repository: openmle/omle-runtime
+          ref: ${{ env.OMLE_RUNTIME_REF }}
           path: omle-runtime
       # omle-runtime generates omle.pb.cc from this repository's schema.
       - uses: actions/checkout@v4.2.2
         with:
           repository: openmle/omle
+          ref: ${{ env.OMLE_REF }}
           path: omle
 
       # Only the toolchain and the two libraries the bundled build still links
@@ -90,25 +155,217 @@ jobs:
       # avoid.
       - name: Install the toolchain (manylinux)
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          dnf install -y cmake ninja-build git openssl-devel jsoncpp-devel
+          # jsoncpp is NOT installed: bundled_deps.cmake vendors it, and a
+          # system copy is what it exists to avoid. libuuid and zlib are needed
+          # because Drogon's own CMakeLists calls find_package(UUID REQUIRED)
+          # and find_package(ZLIB REQUIRED) on Linux — it builds from source
+          # here but still resolves those two against the system.
+          # openssl, uuid and zlib: the three libraries the bundled build still
+          # resolves against the system. gRPC, Abseil, protobuf, Drogon,
+          # jsoncpp and simdjson are compiled from pinned source by
+          # cmake/bundled_deps.cmake and must NOT be installed — finding a
+          # system copy is the failure that build exists to prevent, and the
+          # "links nothing it should have absorbed" assert below catches it.
+          #
+          # OpenSSL is external by design: a vendored libssl stops receiving
+          # the distribution's security updates. Drogon's own CMakeLists calls
+          # find_package on UUID and ZLIB even when built from source.
+          #
+          # No perl here: nothing builds OpenSSL from source on this path, so
+          # the Perl modules its Configure needs are not required either.
+          # openssl3-devel, not openssl-devel.
+          #
+          # This image's openssl-devel is 1.1.1k, EOL since 2023, with soname
+          # libssl.so.1.1. Building against it produced a wheel that auditwheel
+          # then VENDORED — the --exclude flags below name libssl.so.3 and
+          # never matched — so the wheel shipped libssl-<hash>.so.1.1.1k
+          # embedded, which is exactly what the no-vendored-crypto rule exists
+          # to prevent, with a version that stopped receiving fixes years ago.
+          #
+          # EPEL's openssl3 is side-installed so it can coexist with 1.1.1:
+          # headers under /usr/include/openssl3 and the dev symlink under
+          # /usr/lib64/openssl3, which is why find_package(OpenSSL) cannot see
+          # it unaided and the build step passes explicit paths. The runtime
+          # library is in the normal place with the normal soname:
+          #
+          #   /usr/lib64/libssl.so.3 -> libssl.so.3.5.5   SONAME libssl.so.3
+          #
+          # so the binary records libssl.so.3, --exclude matches, and the
+          # user's own OpenSSL 3 resolves it at load time.
+          dnf install -y cmake ninja-build git openssl3-devel libuuid-devel zlib-devel
+
+          # Put one of manylinux's own interpreters on PATH.
+          #
+          # The container's /usr/bin/python3 is a perfectly modern 3.12, but it
+          # ships no pip at all — "No module named pip". manylinux keeps the
+          # interpreters that do have pip under /opt/python/<tag>/bin and puts
+          # none of them on PATH. Verified against the image:
+          #
+          #   /usr/bin/python3                     3.12.14, no pip
+          #   /opt/python/cp312-cp312/bin/python3  3.12.14, pip 26.2.1
+          #
+          # Doing this here rather than in the Conan step keeps
+          # `python3 -m pip install conan` identical on all three platforms,
+          # and gives the wheel build below a modern python too.
+          PYBIN=$(ls -d /opt/python/cp312-cp312/bin 2>/dev/null || true)
+          if [ -z "$PYBIN" ]; then
+            # Excludes the free-threaded cp3XXt builds, which sort last and
+            # are not what a wheel-building job wants.
+            PYBIN=$(ls -d /opt/python/cp3*/bin 2>/dev/null \
+                    | grep -v 't/bin$' | sort -V | tail -1)
+          fi
+          if [ -z "$PYBIN" ]; then
+            echo "::error::no interpreter under /opt/python in this image"
+            exit 1
+          fi
+          echo "using $PYBIN"
+          "$PYBIN/python3" --version
+          echo "$PYBIN" >> "$GITHUB_PATH"
 
       - name: Install the toolchain (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake ninja jsoncpp openssl@3
+        # OpenSSL is platform-provided by the Conan profile, so Homebrew's copy
+        # is what the binary links and delocate excludes from the wheel.
+        run: brew install cmake ninja openssl@3
 
+      # Not for Linux: the manylinux container supplies its own interpreters.
       - uses: actions/setup-python@v5.6.0
-        if: runner.os == 'macOS'
+        if: runner.os != 'Linux'
         with:
           python-version: "3.12"
 
+      # Windows has no apt or brew for Drogon and gRPC. Conan provides them as
+      # prebuilt msvc binaries, statically linked, so the executable is still
+      # self-contained. -pr:a applies the pinned profile to the host and build
+      # contexts: [tool_requires] resolves in the latter, and settings passed
+      # with -s reach only the former. --build=never fails fast if a binary is
+      # ever absent rather than silently building gRPC from source.
+      - name: Cache the Conan package cache
+        if: matrix.bundled == 'OFF'
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ matrix.profile }}-${{ hashFiles('omle-server/conanfile.txt', format('omle-server/conan/profiles/{0}', matrix.profile)) }}
+
+      - name: Install dependencies (Conan)
+        if: matrix.bundled == 'OFF'
+        working-directory: omle-server
+        shell: bash
+        run: |
+          python3 -m pip install conan
+          conan install . \
+            --output-folder=build/conan \
+            --build=${{ matrix.conan_build }} \
+            -pr:a=conan/profiles/${{ matrix.profile }}
+
+          # --build=missing is necessary here (OpenSSL has no prebuilt shared
+          # variant) but it is also silent: if the runner's compiler ever stops
+          # matching the profile, every package_id changes and Conan quietly
+          # compiles the whole graph — gRPC, Abseil, protobuf, boost — turning a
+          # three-minute job into an hour-long one that still passes.
+          #
+          # So the expensive packages are asserted to have come prebuilt. This
+          # fails in seconds with the resolved profile in the log, which is what
+          # you need to see to fix the pin.
+          # A relative path, not /tmp: this step runs under bash on every
+          # platform, but the heredoc below is interpreted by native Windows
+          # Python, which reads an absolute "/tmp/..." as C:\tmp\... and not
+          # as git-bash's /tmp. The redirect succeeded and the open() failed.
+          conan graph info . -pr:a=conan/profiles/${{ matrix.profile }} \
+            --format=json > build/conan-graph.json
+          python3 - <<'PYEOF'
+          import json
+          g = json.load(open("build/conan-graph.json"))
+          prebuilt = {"Download", "Cache", "Skip", "Platform"}
+          expensive = {"grpc", "protobuf", "abseil", "drogon", "boost"}
+          built = sorted({n.get("name") for n in g["graph"]["nodes"].values()
+                          if n.get("binary") and n["binary"] not in prebuilt
+                          and n.get("name") in expensive})
+          if built:
+              raise SystemExit(
+                  f"::error::{built} would be built from source. The profile no "
+                  "longer matches what ConanCenter publishes — check the "
+                  "compiler version and cppstd above against conan/profiles/.")
+          print("expensive packages all prebuilt")
+          PYEOF
+
+      # The bundled rows fetch gRPC, Drogon, jsoncpp and simdjson from pinned
+      # source. Cloning gRPC's submodule tree — Abseil, protobuf, BoringSSL,
+      # re2, c-ares — dominates that work; it is the clone, not the compile.
+      # So this cache is what makes the bundled path affordable on every push.
+      #
+      # Keyed on bundled_deps.cmake, so bumping a pin there invalidates it and
+      # nothing else does.
+      - name: Cache fetched dependency sources
+        if: matrix.bundled == 'ON'
+        uses: actions/cache@v4
+        with:
+          path: omle-server/build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('omle-server/cmake/bundled_deps.cmake') }}
+
       - name: Build the self-contained binary
         working-directory: omle-server
+        shell: bash
         run: |
-          cmake -S . -B build -G Ninja \
+          # Same shape as test.yml's Configure/Build, so the wheel is produced
+          # by the configuration the tests exercised.
+          #
+          # No -G on Windows: CMake then defaults to the Visual Studio
+          # generator and builds with MSVC, which is what every other Windows
+          # artifact in the project uses. Forcing Ninja picks up whatever
+          # compiler is first on PATH — MinGW GCC on the runner image — giving a
+          # binary with a different C++ runtime. Visual Studio is multi-config,
+          # so --config carries the build type and the output lands in
+          # build/Release/.
+          #
+          # CMP0091 NEW lets the toolchain set the MSVC runtime through
+          # CMAKE_MSVC_RUNTIME_LIBRARY rather than baking it into
+          # CMAKE_CXX_FLAGS, which is what keeps it consistent with the
+          # downloaded binaries. It is a no-op off Windows.
+          GEN="-G Ninja"
+          EXTRA=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GEN=""
+          fi
+          # macOS: pin the deployment target, or the wheel is stamped with the
+          # runner's OS version.
+          #
+          # Left unset, the compiler targets the build machine, and the runner
+          # is macOS 26. delocate derives the wheel's minimum OS from the
+          # binary, so 0.1.0rc5 shipped as
+          #
+          #   omle_server-0.1.0rc5-py3-none-macosx_26_0_arm64.whl
+          #
+          # installable only on macOS 26+. On anything older pip reports
+          # "Could not find a version that satisfies the requirement" — the
+          # project is found, no distribution matches.
+          #
+          # 11.0 matches omle-runtime, which ships macosx_11_0_arm64. It is
+          # reachable only because this row builds its dependencies from
+          # source; ConanCenter's macOS binaries carry minos 14.0 and would
+          # force a macOS 14 floor. 11.0 is the arm64 floor — no earlier macOS
+          # runs on Apple silicon.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export MACOSX_DEPLOYMENT_TARGET=11.0
+          fi
+          if [ "${{ matrix.bundled }}" = "OFF" ]; then
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
+            EXTRA="$EXTRA -DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
+          fi
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # EPEL's openssl3 is side-installed, so find_package(OpenSSL) does
+            # not find it and would silently fall back to the image's EOL
+            # 1.1.1k. See the toolchain step above.
+            EXTRA="$EXTRA -DOPENSSL_INCLUDE_DIR=/usr/include/openssl3"
+            EXTRA="$EXTRA -DOPENSSL_SSL_LIBRARY=/usr/lib64/openssl3/libssl.so"
+            EXTRA="$EXTRA -DOPENSSL_CRYPTO_LIBRARY=/usr/lib64/openssl3/libcrypto.so"
+          fi
+          cmake -S . -B build $GEN $EXTRA \
             -DCMAKE_BUILD_TYPE=Release \
-            -DOMLE_SERVER_BUNDLE_DEPS=ON
-          cmake --build build --target omle_server -j 4
+            -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }}
+          cmake --build build --target omle_server --config Release -j 4
 
       - name: Assert it links nothing it should have absorbed
         working-directory: omle-server
@@ -122,6 +379,21 @@ jobs:
           case "$RUNNER_OS" in
             Linux) LEAKED=$(ldd "$BIN" | grep -ciE 'grpc|absl|protobuf|drogon|trantor|simdjson|omleruntime' || true) ;;
             macOS) LEAKED=$(otool -L "$BIN" | grep -ciE 'grpc|absl|protobuf|drogon|trantor|simdjson|omleruntime' || true) ;;
+            Windows)
+              BIN=build/Release/omle_server.exe
+              # dumpbin is the MSVC equivalent of ldd, but it is not on PATH
+              # outside a developer prompt, so it is located under the VS
+              # install rather than assumed. Failing to find it is fatal: this
+              # check silently passing is how an unverified wheel ships.
+              DUMPBIN=$(find "/c/Program Files/Microsoft Visual Studio" \
+                             "/c/Program Files (x86)/Microsoft Visual Studio" \
+                        -name dumpbin.exe -path '*Hostx64/x64*' 2>/dev/null | head -1)
+              if [ -z "$DUMPBIN" ]; then
+                echo "::error::dumpbin.exe not found; cannot verify $BIN"
+                exit 1
+              fi
+              LEAKED=$("$DUMPBIN" //dependents "$BIN" | grep -ciE 'grpc|absl|protobuf|drogon|trantor|simdjson|omleruntime' || true)
+              ;;
           esac
           if [ "$LEAKED" -ne 0 ]; then
             echo "::error::$BIN links $LEAKED libraries the bundled build should"
@@ -140,27 +412,184 @@ jobs:
         # package-data ships.
         run: |
           python3 -m pip install --upgrade pip build
+
+          # macOS: name the wheel for the architecture it actually contains.
+          #
+          # The tag comes from the interpreter, not from the binary. python.org
+          # CPython — which actions/setup-python installs — is a universal2
+          # build, so get_platform() reports macosx_10_13_universal2 and the
+          # wheel is named that way even though omle_server here is arm64 only.
+          # delocate validates the binary against the name and stops with
+          #
+          #   DelocationError: Failed to find any binary with the required
+          #   architecture: 'x86_64'
+          #
+          # which is delocate being right: such a wheel would install on an
+          # Intel Mac and then fail to exec. _PYTHON_HOST_PLATFORM is the
+          # override setuptools honours for this, and is what cibuildwheel uses.
+          # 11.0 matches MACOSX_DEPLOYMENT_TARGET in the build step; see there.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export _PYTHON_HOST_PLATFORM=macosx-11.0-arm64
+            export ARCHFLAGS="-arch arm64"
+          fi
+
           mkdir -p python/omle_server/bin
-          cp build/omle_server python/omle_server/bin/
-          chmod 755 python/omle_server/bin/omle_server
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Multi-config generator, and the .exe suffix the console script
+            # and python/tests/conftest.py both expect.
+            cp build/Release/omle_server.exe python/omle_server/bin/
+          else
+            cp build/omle_server python/omle_server/bin/
+            chmod 755 python/omle_server/bin/omle_server
+          fi
           cd python && python3 -m build --wheel
 
-      # Vendors the remaining external libraries (OpenSSL, jsoncpp) into the
-      # wheel and rewrites the binary's load paths, and on Linux retags the
-      # wheel to the manylinux baseline PyPI accepts.
+      # Retags the wheel to the manylinux baseline PyPI accepts. --exclude
+      # keeps OpenSSL out: auditwheel would otherwise copy libssl/libcrypto in
+      # and the wheel would carry a crypto library frozen at build time.
       - name: Repair the wheel (Linux)
         if: runner.os == 'Linux'
         working-directory: omle-server/python
         run: |
           python3 -m pip install auditwheel
-          auditwheel repair dist/*.whl -w wheelhouse/ --plat manylinux_2_28_${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
+          auditwheel repair dist/*.whl -w wheelhouse/ \
+            --plat manylinux_2_28_x86_64 \
+            --exclude libssl.so.3 --exclude libcrypto.so.3
 
       - name: Repair the wheel (macOS)
         if: runner.os == 'macOS'
         working-directory: omle-server/python
+        # --exclude matches on path substring, so these cover libssl.3.dylib
+        # and libcrypto.3.dylib wherever Homebrew put them.
         run: |
           python3 -m pip install delocate
-          delocate-wheel -w wheelhouse/ -v dist/*.whl
+          delocate-wheel -w wheelhouse/ -v \
+            --exclude libssl --exclude libcrypto \
+            dist/*.whl
+
+      # auditwheel and delocate write wheelhouse/ as part of repairing. Windows
+      # has neither and needs none — nothing is vendored in beyond what MSVC
+      # statically linked — but the steps below read wheelhouse/, so the wheel
+      # is moved there unchanged rather than special-casing two later steps.
+      - name: Collect the wheel (Windows)
+        if: runner.os == 'Windows'
+        working-directory: omle-server/python
+        shell: bash
+        run: |
+          mkdir -p wheelhouse
+          cp dist/*.whl wheelhouse/
+
+      # The wheel must not reference the build machine's Conan cache.
+      #
+      # OpenSSL is linked shared so the system copy is used at runtime, and the
+      # repair steps above exclude it from the wheel for that reason. On macOS
+      # that leaves whatever load command the linker recorded, which for a
+      # Conan package is an absolute path under ~/.conan2/p/. Such a wheel
+      # installs, imports and passes any check that only looks for the binary —
+      # and then fails on every machine that is not this runner, because that
+      # path does not exist there.
+      #
+      # Checked on Linux too, where DT_NEEDED normally holds the bare soname
+      # and this should never fire.
+      - name: Assert the wheel references no build-machine paths
+        working-directory: omle-server/python
+        shell: bash
+        run: |
+          rm -rf _whlcheck && mkdir _whlcheck
+          python3 -c "
+          import glob, zipfile
+          zipfile.ZipFile(glob.glob('wheelhouse/*.whl')[0]).extractall('_whlcheck')
+          "
+          # -type f and the bin/ path: the wheel also contains a package
+          # DIRECTORY named omle_server, which a bare -name match finds first.
+          # otool then fails with "can't map file", REFS comes back empty, and
+          # the loop below iterates over nothing and reports success.
+          BIN=$(find _whlcheck -type f -path '*/bin/omle_server*' | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no binary in wheel"; exit 1; fi
+          case "$RUNNER_OS" in
+            macOS) REFS=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}') ;;
+            # NEEDED only. RUNPATH/RPATH entries are $ORIGIN-relative — the
+            # loader expands them against the binary's own location, so they
+            # are not paths that exist at build time and testing them with -e
+            # always fails. auditwheel adds exactly one,
+            # $ORIGIN/../../omle_server.libs, pointing at the libraries it
+            # vendored into the wheel.
+            Linux) REFS=$(objdump -p "$BIN" | awk '/NEEDED/ {print $2}') ;;
+            Windows)
+              # dumpbin is the MSVC equivalent and is not on PATH outside a
+              # developer prompt, so it is located under the VS install. PE
+              # imports are bare DLL names resolved by the loader's search
+              # order, like an ELF soname, so the path checks below simply do
+              # not fire — but the listing still has to be readable, which is
+              # what catches a truncated or unreadable binary.
+              DUMPBIN=$(find "/c/Program Files/Microsoft Visual Studio" \
+                             "/c/Program Files (x86)/Microsoft Visual Studio" \
+                        -name dumpbin.exe -path '*Hostx64/x64*' 2>/dev/null | head -1)
+              if [ -z "$DUMPBIN" ]; then
+                echo "::error::dumpbin.exe not found; cannot inspect $BIN"
+                exit 1
+              fi
+              REFS=$("$DUMPBIN" //dependents "$BIN" \
+                     | awk '/^ +[A-Za-z0-9_.+-]+\.[Dd][Ll][Ll]$/ {print $1}')
+              ;;
+            *)
+              echo "::error::no dependency inspector for $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          echo "$REFS" | sed 's/^/  /'
+
+          # An empty listing means the tool failed, not that the binary has no
+          # dependencies. Treating that as a pass is how this check silently
+          # stopped checking.
+          if [ -z "$(echo "$REFS" | tr -d '[:space:]')" ]; then
+            echo "::error::could not read the dependencies of $BIN"
+            exit 1
+          fi
+
+          BAD=0
+          for ref in $REFS; do
+            # Relative names resolve at load time: a bare soname on Linux, or
+            # @rpath/@loader_path/@executable_path on macOS.
+            case "$ref" in
+              # Loader-relative, resolved at run time: @rpath/@loader_path on
+              # macOS, $ORIGIN on Linux. Not testable here.
+              @*|\$ORIGIN*|*/) continue ;;
+              */*) : ;;
+              *) continue ;;
+            esac
+            # An absolute path into the build machine's package cache exists
+            # here and nowhere else.
+            case "$ref" in
+              *.conan2*|/home/runner/*|/Users/runner/*)
+                echo "::error::$ref points into the build machine's package cache"
+                BAD=1; continue ;;
+            esac
+            # System locations are exempt: since Big Sur, macOS ships its
+            # system dylibs in the dyld shared cache rather than on disk, so
+            # /usr/lib/libSystem.B.dylib is resolvable at load time while
+            # failing an -e test. Linux's are real files, but exempting the
+            # same prefixes there costs nothing.
+            case "$ref" in
+              /usr/lib/*|/System/*|/lib64/*|/usr/lib64/*) continue ;;
+            esac
+            # Any other absolute path that does not resolve even on the machine
+            # that produced the wheel cannot resolve anywhere. Conan's macOS
+            # OpenSSL carries install_name /lib/libssl.3.dylib, and macOS has
+            # no /lib at all — so excluding it from the wheel leaves a
+            # reference that can never be satisfied.
+            if [ ! -e "$ref" ]; then
+              echo "::error::$ref does not exist even on this runner"
+              BAD=1
+            fi
+          done
+          if [ "$BAD" -ne 0 ]; then
+            echo "::error::the wheel references libraries that will not resolve"
+            echo "on a user's machine. A library excluded from the wheel has to"
+            echo "resolve by soname or by a path that genuinely exists there."
+            exit 1
+          fi
+          echo "all references resolvable"
 
       - name: Show what shipped
         working-directory: omle-server/python
@@ -174,7 +603,7 @@ jobs:
             python3 - "$whl" <<'PY'
           import sys, zipfile
           names = zipfile.ZipFile(sys.argv[1]).namelist()
-          binaries = [n for n in names if "/bin/omle_server" in n]
+          binaries = [n for n in names if "/bin/omle_server" in n]  # matches .exe too
           for n in sorted(names):
               print(f"  {n}")
           if not binaries:
