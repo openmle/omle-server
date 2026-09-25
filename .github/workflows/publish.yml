@@ -682,9 +682,6 @@ jobs:
             runner: ubuntu-24.04-arm
             platform: linux/arm64
 
-    outputs:
-      repository: ${{ steps.repo.outputs.name }}
-
     steps:
       - uses: actions/checkout@v4.2.2
         # The Dockerfile clones omle-runtime and omle itself, so unlike the
@@ -770,6 +767,18 @@ jobs:
           path: /tmp/digests
           merge-multiple: true
 
+      # Resolved here rather than taken from docker-build's job outputs. That
+      # output arrived empty, and because an empty image name is still a valid
+      # metadata-action input it did not fail the step: it produced bare tags
+      # ("0.2.0-rc1") and bare digests ("@sha256:..."), and imagetools rejected
+      # them. docker-build is a matrix, whose job outputs are a known sharp edge
+      # in Actions, and this value never needed to cross a job boundary anyway —
+      # it is the same expression evaluated in the same way.
+      - id: repo
+        run: |
+          echo "name=${{ vars.DOCKERHUB_REPOSITORY || 'omle/omle-server' }}" \
+            >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -783,7 +792,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ needs.docker-build.outputs.repository }}
+          images: ${{ steps.repo.outputs.name }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -795,11 +804,21 @@ jobs:
           # Newline-separated, straight from metadata-action. Using this rather
           # than parsing its JSON keeps jq out of the picture.
           TAGS: ${{ steps.meta.outputs.tags }}
-          REPO: ${{ needs.docker-build.outputs.repository }}
+          REPO: ${{ steps.repo.outputs.name }}
         run: |
+          # Both failure modes from the empty-image-name bug produced
+          # arguments that looked plausible until imagetools parsed them, so
+          # assert the name is there before composing any of them.
+          [ -n "$REPO" ] || { echo "::error::repository name is empty"; exit 1; }
+
           TAG_ARGS=""
           while IFS= read -r t; do
-            [ -n "$t" ] && TAG_ARGS="$TAG_ARGS -t $t"
+            [ -n "$t" ] || continue
+            case "$t" in
+              "$REPO":*) ;;
+              *) echo "::error::tag '$t' is not under $REPO"; exit 1 ;;
+            esac
+            TAG_ARGS="$TAG_ARGS -t $t"
           done <<< "$TAGS"
           [ -n "$TAG_ARGS" ] || { echo "::error::no tags to publish"; exit 1; }
 
