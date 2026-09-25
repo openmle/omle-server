@@ -1,0 +1,43 @@
+# Keep the build context small and, more importantly, hermetic.
+#
+# This lives at the repository root rather than beside docker/Dockerfile
+# because the classic builder reads .dockerignore from the context directory.
+# A copy in docker/ would be silently ignored, and build/ would be shipped into
+# the image with it.
+#
+# build/ is the reason this file exists. A local CMake cache carries absolute
+# host paths and a configured dependency tree; copied into the image it would
+# either be used — pointing at directories that do not exist there — or
+# silently reconfigured, making the image depend on whatever state the
+# developer's working tree happened to be in.
+
+build/
+build_*/
+cmake-build-*/
+_deps/
+CMakeUserPresets.json
+compile_commands.json
+
+.git/
+.github/
+.gitignore
+.dockerignore
+
+# The build files themselves. Passing --file from outside the context is what
+# lets this be excluded: the Dockerfile is read from the path given, not from
+# the copied tree, so nothing here needs to reach the image.
+docker/
+
+python/dist/
+python/wheelhouse/
+python/build/
+python/*.egg-info/
+python/omle_server/bin/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+.DS_Store
+**/.DS_Store

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "setuptools-scm>=8", "wheel"]
+requires = ["setuptools>=77", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +8,67 @@ dynamic = ["version"]
 description = "Open Inference Protocol (OIP) server for OMLE models over REST and gRPC"
 requires-python = ">=3.10"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "OMLE contributors" }]
+keywords = [
+    "machine-learning", "inference", "model-serving", "inference-server",
+    "open-inference-protocol", "rest", "grpc",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    # Not "OS Independent", unlike the pure-Python siblings: the payload is a
+    # compiled executable. Wheels exist for these three platforms only, and
+    # anything else builds the server from source.
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    # One py3-none-<platform> wheel serves every interpreter -- the binary is
+    # exec'd, never imported, so it is independent of the Python version and
+    # its ABI. These record the versions CI exercises, not one wheel each.
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
 # No Python dependencies: the payload is a statically linked executable. Its one
 # runtime requirement, OpenSSL 3, is a system library that this field cannot
 # express — see README.md.
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/openmle/omle-server"
+Source = "https://github.com/openmle/omle-server"
+Issues = "https://github.com/openmle/omle-server/issues"
+
 [project.optional-dependencies]
-dev = ["pytest", "requests", "grpcio", "grpcio-tools"]
+# requests drives the REST suite; grpcio the gRPC one, with grpcio-tools there
+# to regenerate the stubs.
+#
+# tests/open_inference_grpc_pb2*.py are committed and stamped by protoc 6.31.1.
+# A protobuf runtime OLDER than that stamp refuses to import them; newer is
+# fine (checked against 7.36). grpcio-tools 1.74 is the first release whose own
+# protobuf floor reaches 6.31.1, so pinning below it can satisfy the resolver
+# while still producing an environment the stubs will not load in.
+dev = [
+    "pytest>=8.0",
+    "requests>=2.28",
+    "grpcio>=1.62",
+    "protobuf>=6.31.1",
+    "grpcio-tools>=1.74",
+    # Local enforcement of .pre-commit-config.yaml, which is clang-format over
+    # the C++ sources rather than anything Python. The hook lives in
+    # .git/hooks/, which no clone inherits, so it needs a one-time
+    # `pre-commit install` per checkout; CI runs the same config.
+    "pre-commit>=4.0",
+]
 
 [project.scripts]
 omle-server = "omle_server._cli:main"

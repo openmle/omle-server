@@ -16,8 +16,96 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  # Weekly, for the docker job. Its inputs are not only this repository: the
+  # base image, its package versions and the two sibling repositories it clones
+  # at main all move underneath it, so an image that built on Monday can fail on
+  # Friday with nothing here having changed. A push-triggered job, which only
+  # fires on changes to this repository, would never notice.
+  schedule:
+    - cron: "17 5 * * 1"
+  # The docker job is otherwise skipped unless image-affecting paths change,
+  # which leaves no way to exercise it on demand. This is that way.
+  workflow_dispatch:
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Which of the slow jobs need to run.
+  #
+  # The docker job compiles every dependency from source, so paying for it on a
+  # push that edited a .cpp file is poor value: an ordinary source change does
+  # not break an image that already builds. What does break it lives in a small
+  # set of paths — the Dockerfile, the ignore file, and the CMake that decides
+  # what gets built and what is expected from the system.
+  #
+  # Errs toward running. A range this cannot compute — a new branch, a force
+  # push, a shallow history — reports true rather than skipping a check on the
+  # assumption that nothing relevant moved.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect image-affecting changes
+    runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          # Needed to diff against anything: the default shallow clone has no
+          # merge base and no previous commit.
+          fetch-depth: 0
+
+      - id: filter
+        shell: bash
+        run: |
+          # Paths whose change can plausibly break the image.
+          #
+          # cmake/ and CMakeLists.txt are in the list because they decide which
+          # dependencies are bundled and which are expected from the system —
+          # exactly the assumptions the base image has to satisfy.
+          PATTERN='^(docker/|\.dockerignore$|CMakeLists\.txt$|cmake/)'
+
+          run_it() { echo "docker=true"  >> "$GITHUB_OUTPUT"; echo "$1"; exit 0; }
+          skip_it() { echo "docker=false" >> "$GITHUB_OUTPUT"; echo "$1"; exit 0; }
+
+          case "${{ github.event_name }}" in
+            schedule|workflow_dispatch)
+              run_it "event is ${{ github.event_name }} — building unconditionally" ;;
+          esac
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="origin/${{ github.base_ref }}"
+            # No --depth: checkout above already made a full clone, and
+            # `--depth=0` is not a valid git argument — it fails with "depth 0
+            # is not a positive number", which the || true would have hidden,
+            # leaving the base ref unfetched and every PR building the image.
+            git fetch --quiet origin "${{ github.base_ref }}" 2>/dev/null || true
+            git rev-parse --verify "$BASE" >/dev/null 2>&1 \
+              || run_it "cannot resolve $BASE — building to be safe"
+            RANGE="$BASE...HEAD"
+          else
+            BEFORE="${{ github.event.before }}"
+            # All-zero means a newly created branch: there is no previous commit
+            # to diff against.
+            case "$BEFORE" in
+              ""|0000000000000000000000000000000000000000)
+                run_it "no previous commit — building to be safe" ;;
+            esac
+            git rev-parse --verify "$BEFORE" >/dev/null 2>&1 \
+              || run_it "cannot resolve $BEFORE (force push?) — building to be safe"
+            RANGE="$BEFORE..HEAD"
+          fi
+
+          CHANGED=$(git diff --name-only "$RANGE") \
+            || run_it "git diff $RANGE failed — building to be safe"
+
+          echo "changed files in $RANGE:"
+          echo "$CHANGED" | sed 's/^/  /'
+
+          if echo "$CHANGED" | grep -qE "$PATTERN"; then
+            echo "$CHANGED" | grep -E "$PATTERN" | sed 's/^/  matched: /'
+            run_it "image-affecting paths changed"
+          fi
+          skip_it "no image-affecting paths changed"
+
   # ---------------------------------------------------------------------------
   # Style — runs .pre-commit-config.yaml, the same file the local git hook runs,
   # so the two cannot drift. Seconds, and it fails before the build has finished
@@ -326,3 +414,106 @@ jobs:
         # protocols, so they are the only check that the two OIP surfaces agree
         # with each other and with the runtime.
         run: pytest -q
+
+  # ---------------------------------------------------------------------------
+  # Docker image — builds docker/Dockerfile and proves the result actually
+  # serves, not merely that it compiled.
+  #
+  # This is the slowest job here by a wide margin: the image builds every
+  # dependency from pinned source, and cloning gRPC's submodule tree (Abseil,
+  # protobuf, BoringSSL, re2, c-ares) dominates. The buildx cache below is what
+  # keeps repeat runs bearable — a push that touches neither the Dockerfile nor
+  # cmake/ reuses the dependency layers and only recompiles the server.
+  #
+  # Nothing else in this repository builds the image, so without this job a
+  # broken base-image assumption — a renamed package, an OpenSSL soname change —
+  # would surface first for whoever ran `docker build`, not in CI.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    needs: changes
+    # Skipped rather than failed when nothing image-affecting changed, so the
+    # job shows as skipped on ordinary pushes and does not gate a merge.
+    if: needs.changes.outputs.docker == 'true'
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      # The Dockerfile clones omle-runtime and omle itself, at the refs pinned
+      # in its ARGs, so unlike the build-and-test job this one needs no sibling
+      # checkouts.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true          # into the local daemon, so the next step can run it
+          push: false
+          tags: omle-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # The Dockerfile clones the siblings at main, and that RUN's text does
+          # not change when main does — so a cached clone layer would be reused
+          # and the weekly canary would re-verify last week's sources. Only the
+          # scheduled run pays for a cold build; path-triggered builds, where
+          # the change under test is in this repository, keep the cache.
+          no-cache: ${{ github.event_name == 'schedule' }}
+
+      # A build that succeeds and an image that works are different claims. The
+      # binary is statically linked against everything except OpenSSL and libc,
+      # so the failure this catches is a runtime stage missing a shared library
+      # the builder had — which a build alone cannot detect.
+      - name: Run the image and check it serves
+        run: |
+          mkdir -p /tmp/models
+          cp tests/data/*.omle /tmp/models/
+
+          docker run -d --name omle-ci \
+            -v /tmp/models:/models:ro \
+            -p 18080:8080 -p 18081:8081 \
+            omle-server:ci
+
+          # Poll rather than sleep: the model registry loads before the REST
+          # listener answers ready, and how long that takes depends on the
+          # runner.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/v2/health/ready >/dev/null 2>&1; then
+              echo "ready after ${i}s"; break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::server did not become ready"
+              docker logs omle-ci; exit 1
+            fi
+            sleep 1
+          done
+
+          # /ready alone would pass with an empty registry, so assert the model
+          # mounted from the volume is actually loaded and answering.
+          curl -fsS http://127.0.0.1:18080/v2/models/test_model_2f/ready
+          curl -fsS http://127.0.0.1:18080/v2/models/test_model_2f | tee /tmp/meta.json
+          grep -q '"name":"test_model_2f"' /tmp/meta.json \
+            || { echo "::error::model metadata missing"; exit 1; }
+
+      # The image claims to be self-contained apart from OpenSSL and system
+      # libraries. Checked here rather than trusted: the builder stage asserts
+      # the same thing, but only this step sees the runtime image, where a
+      # missing library shows up as an unresolved dependency.
+      - name: Assert the runtime image resolves every library
+        run: |
+          docker run --rm --entrypoint sh omle-server:ci -c \
+            'ldd /usr/local/bin/omle-server' | tee /tmp/ldd.txt
+          if grep -q "not found" /tmp/ldd.txt; then
+            echo "::error::unresolved shared libraries in the runtime image"
+            exit 1
+          fi
+          echo "all libraries resolve"
+
+      - name: Image size
+        run: docker image ls omle-server:ci --format '  {{.Repository}}:{{.Tag}}  {{.Size}}'
+
+      - name: Stop
+        if: always()
+        run: docker rm -f omle-ci 2>/dev/null || true

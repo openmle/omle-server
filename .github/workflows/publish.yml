@@ -644,3 +644,183 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: ${{ (github.event_name == 'workflow_dispatch' && inputs.index == 'testpypi') && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+
+  # ---------------------------------------------------------------------------
+  # 3. The container image → Docker Hub.
+  #
+  # Independent of the wheels: nothing here consumes them, and a wheel failure
+  # should not block an image or the reverse. Both come from the same tag, so
+  # they describe the same commit either way.
+  #
+  # Built per architecture on a native runner rather than under QEMU. The image
+  # compiles gRPC's submodule tree from source, and emulating arm64 for that
+  # turns a long build into an unusable one; two native runners do it in
+  # parallel instead. Each pushes by digest and the manifest job below joins
+  # them into one multi-architecture tag, which is what lets `docker pull` work
+  # unqualified on Apple silicon and Graviton as well as x86_64.
+  #
+  # Free arm64 runners are public-repository only. Drop that matrix row if this
+  # repository is private, at the cost of an amd64-only image.
+  #
+  # Secrets and variables this needs, configured once:
+  #   secrets.DOCKERHUB_USERNAME   Docker Hub account or org
+  #   secrets.DOCKERHUB_TOKEN      access token, not the password
+  #   vars.DOCKERHUB_REPOSITORY    optional; defaults to omle/omle-server
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: Image (${{ matrix.arch }})
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+
+    outputs:
+      repository: ${{ steps.repo.outputs.name }}
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        # The Dockerfile clones omle-runtime and omle itself, so unlike the
+        # wheels job this needs no sibling checkouts. It pins them in ARGs,
+        # overridden below so image and wheels are built from the same refs.
+
+      - id: repo
+        run: |
+          echo "name=${{ vars.DOCKERHUB_REPOSITORY || 'omle/omle-server' }}" \
+            >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Pushed by digest, without a tag: a tag written twice, once per
+      # architecture, would leave whichever job finished last as the only one
+      # visible. The manifest job assembles the tags from these digests.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            OMLE_RUNTIME_REF=${{ env.OMLE_RUNTIME_REF }}
+            OMLE_REF=${{ env.OMLE_REF }}
+          outputs: type=image,name=${{ steps.repo.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # The same check test.yml runs, repeated here because this artifact is the
+      # one users pull: an image that builds but cannot serve is worse published
+      # than unpublished.
+      - name: Run the pushed image and check it serves
+        run: |
+          IMAGE="${{ steps.repo.outputs.name }}@${{ steps.build.outputs.digest }}"
+          mkdir -p /tmp/models && cp tests/data/*.omle /tmp/models/
+
+          docker run -d --name omle-verify \
+            -v /tmp/models:/models:ro -p 18080:8080 "$IMAGE"
+
+          for i in $(seq 1 45); do
+            curl -fsS http://127.0.0.1:18080/v2/health/ready >/dev/null 2>&1 && break
+            if [ "$i" -eq 45 ]; then
+              echo "::error::pushed image never became ready"
+              docker logs omle-verify; exit 1
+            fi
+            sleep 1
+          done
+
+          # Ready alone passes with an empty registry, so assert the mounted
+          # model loaded and answers.
+          curl -fsS "http://127.0.0.1:18080/v2/models/test_model_2f/ready"
+          docker rm -f omle-verify >/dev/null
+
+      - name: Record the digest
+        run: |
+          mkdir -p /tmp/digests
+          echo -n "${{ steps.build.outputs.digest }}" \
+            > "/tmp/digests/${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    name: Publish the multi-arch tag
+    needs: docker-build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # `latest` only for a final release. Moving it to a release candidate
+      # would hand rc code to everyone who pulls the image without a tag, which
+      # is the majority.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.docker-build.outputs.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, 'rc') && !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'dev') }}
+
+      - name: Create and push the manifest
+        shell: bash
+        env:
+          # Newline-separated, straight from metadata-action. Using this rather
+          # than parsing its JSON keeps jq out of the picture.
+          TAGS: ${{ steps.meta.outputs.tags }}
+          REPO: ${{ needs.docker-build.outputs.repository }}
+        run: |
+          TAG_ARGS=""
+          while IFS= read -r t; do
+            [ -n "$t" ] && TAG_ARGS="$TAG_ARGS -t $t"
+          done <<< "$TAGS"
+          [ -n "$TAG_ARGS" ] || { echo "::error::no tags to publish"; exit 1; }
+
+          DIGEST_ARGS=""
+          for f in /tmp/digests/*; do
+            DIGEST_ARGS="$DIGEST_ARGS $REPO@$(cat "$f")"
+          done
+          [ -n "$DIGEST_ARGS" ] || { echo "::error::no digests found"; exit 1; }
+
+          echo "tags:   $TAG_ARGS"
+          echo "images: $DIGEST_ARGS"
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $TAG_ARGS $DIGEST_ARGS
+
+      - name: Show what was published
+        shell: bash
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            echo "=== $t"
+            docker buildx imagetools inspect "$t" | sed 's/^/  /'
+          done <<< "$TAGS"

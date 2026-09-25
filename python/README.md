@@ -1,4 +1,7 @@
-# omle-server
+# OMLE Server
+
+[![PyPI](https://img.shields.io/pypi/v/omle-server.svg)](https://pypi.org/project/omle-server/)
+[![Tests](https://github.com/openmle/omle-server/actions/workflows/test.yml/badge.svg)](https://github.com/openmle/omle-server/actions/workflows/test.yml)
 
 Inference server for OMLE models, speaking the
 [Open Inference Protocol](https://github.com/kserve/open-inference-protocol)
@@ -9,7 +12,7 @@ pip install omle-server
 omle-server                        # built-in defaults
 omle-server --help                 # every flag
 omle-server --model-dir ./models --rest-port 9000
-omle-server /etc/omle/server.json  # an explicit config
+omle-server --config /etc/omle/server.json
 ```
 
 This package is a delivery vehicle for a compiled binary, not a Python library.
@@ -34,7 +37,11 @@ dnf install openssl-libs     # Fedora / RHEL
 brew install openssl@3       # macOS
 ```
 
-Wheels are published for linux-x86_64, linux-aarch64 and macos-arm64. Other
+Windows is the exception: there is no system OpenSSL to link, so that wheel
+carries its own statically. Nothing to install, but a fix there needs a new
+release rather than an operating-system update.
+
+Wheels are published for linux-x86_64, macos-arm64 and windows-x86_64. Other
 platforms build from source — see the repository README.
 
 ## Configuring
@@ -92,9 +99,16 @@ curl localhost:8080/v2/models/<name>         # input/output metadata
 
 ## Related packages
 
-- [`omle`](https://pypi.org/project/omle/) — the model IR and converters
-- [`omle-runtime`](https://pypi.org/project/omle-runtime/) — the local runtime
-- [`omle-spark`](https://pypi.org/project/omle-spark/) — PySpark transformer
+- [`omle`](https://pypi.org/project/omle/) — the model IR, protobuf I/O and
+  validation
+- [`omle-convert`](https://pypi.org/project/omle-convert/) — converters from
+  trained scikit-learn, XGBoost, LightGBM, CatBoost and Spark ML models
+- [`omle-runtime`](https://pypi.org/project/omle-runtime/) — the C++ inference
+  runtime, with a scikit-learn-style API
+- [`omle-spark`](https://pypi.org/project/omle-spark/) — Spark ML transformer
+  for scoring DataFrames from PySpark
+- [`omle-viewer`](https://pypi.org/project/omle-viewer/) — interactive DAG
+  viewer for Jupyter and the browser
 
 ## License
 
