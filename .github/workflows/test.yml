@@ -1,0 +1,526 @@
+name: Tests
+
+# omle-server is the top of the stack: it compiles omle-runtime as a CMake
+# subproject, and omle-runtime in turn reads omle.proto out of the `omle`
+# repository. So every build job checks out all three as siblings —
+# CMakeLists.txt resolves OMLE_RUNTIME_DIR as ../omle-runtime, and the Python
+# integration tests resolve their fixture models relative to the same layout
+# (python/tests/conftest.py walks four levels up to the workspace root).
+#
+# The C++ unit tests and the Python integration tests share one build: the
+# configure step pulls in gRPC codegen, Drogon and the whole runtime, which is
+# the expensive part, and splitting them into separate jobs would pay it twice.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  # Weekly, for the docker job. Its inputs are not only this repository: the
+  # base image, its package versions and the two sibling repositories it clones
+  # at main all move underneath it, so an image that built on Monday can fail on
+  # Friday with nothing here having changed. A push-triggered job, which only
+  # fires on changes to this repository, would never notice.
+  schedule:
+    - cron: "17 5 * * 1"
+  # The docker job is otherwise skipped unless image-affecting paths change,
+  # which leaves no way to exercise it on demand. This is that way.
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Which of the slow jobs need to run.
+  #
+  # The docker job compiles every dependency from source, so paying for it on a
+  # push that edited a .cpp file is poor value: an ordinary source change does
+  # not break an image that already builds. What does break it lives in a small
+  # set of paths — the Dockerfile, the ignore file, and the CMake that decides
+  # what gets built and what is expected from the system.
+  #
+  # Errs toward running. A range this cannot compute — a new branch, a force
+  # push, a shallow history — reports true rather than skipping a check on the
+  # assumption that nothing relevant moved.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect image-affecting changes
+    runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          # Needed to diff against anything: the default shallow clone has no
+          # merge base and no previous commit.
+          fetch-depth: 0
+
+      - id: filter
+        shell: bash
+        run: |
+          # Paths whose change can plausibly break the image.
+          #
+          # cmake/ and CMakeLists.txt are in the list because they decide which
+          # dependencies are bundled and which are expected from the system —
+          # exactly the assumptions the base image has to satisfy.
+          PATTERN='^(docker/|\.dockerignore$|CMakeLists\.txt$|cmake/)'
+
+          run_it() { echo "docker=true"  >> "$GITHUB_OUTPUT"; echo "$1"; exit 0; }
+          skip_it() { echo "docker=false" >> "$GITHUB_OUTPUT"; echo "$1"; exit 0; }
+
+          case "${{ github.event_name }}" in
+            schedule|workflow_dispatch)
+              run_it "event is ${{ github.event_name }} — building unconditionally" ;;
+          esac
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="origin/${{ github.base_ref }}"
+            # No --depth: checkout above already made a full clone, and
+            # `--depth=0` is not a valid git argument — it fails with "depth 0
+            # is not a positive number", which the || true would have hidden,
+            # leaving the base ref unfetched and every PR building the image.
+            git fetch --quiet origin "${{ github.base_ref }}" 2>/dev/null || true
+            git rev-parse --verify "$BASE" >/dev/null 2>&1 \
+              || run_it "cannot resolve $BASE — building to be safe"
+            RANGE="$BASE...HEAD"
+          else
+            BEFORE="${{ github.event.before }}"
+            # All-zero means a newly created branch: there is no previous commit
+            # to diff against.
+            case "$BEFORE" in
+              ""|0000000000000000000000000000000000000000)
+                run_it "no previous commit — building to be safe" ;;
+            esac
+            git rev-parse --verify "$BEFORE" >/dev/null 2>&1 \
+              || run_it "cannot resolve $BEFORE (force push?) — building to be safe"
+            RANGE="$BEFORE..HEAD"
+          fi
+
+          CHANGED=$(git diff --name-only "$RANGE") \
+            || run_it "git diff $RANGE failed — building to be safe"
+
+          echo "changed files in $RANGE:"
+          echo "$CHANGED" | sed 's/^/  /'
+
+          if echo "$CHANGED" | grep -qE "$PATTERN"; then
+            echo "$CHANGED" | grep -E "$PATTERN" | sed 's/^/  matched: /'
+            run_it "image-affecting paths changed"
+          fi
+          skip_it "no image-affecting paths changed"
+
+  # ---------------------------------------------------------------------------
+  # Style — runs .pre-commit-config.yaml, the same file the local git hook runs,
+  # so the two cannot drift. Seconds, and it fails before the build has finished
+  # installing a toolchain.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+      - run: pip install pre-commit
+      # --show-diff-on-failure prints the patch the autofixing hooks would have
+      # applied, so a red build hands back the fix rather than just a rule name.
+      - run: pre-commit run --all-files --show-diff-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Build, then the C++ unit tests and the Python REST/gRPC integration tests.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: Build and test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every row builds what publish.yml ships, so no released
+          # configuration goes untested and no tested one is unreleased.
+          #
+          # Every row takes its dependencies from ConanCenter as prebuilt
+          # static archives. That is not a different kind of build:
+          # ConanCenter's default is shared=False, so the executable is linked
+          # from the same static libraries cmake/bundled_deps.cmake would
+          # produce, without compiling gRPC's submodule tree to get them.
+          # Linux is bundled, matching publish.yml — and it has to be there,
+          # so it is here too. ConanCenter's Linux binaries are built with
+          # gcc 13 and need GLIBCXX_3.4.32, which no manylinux image provides
+          # (2_28 has 3.4.25; 2_34 has 3.4.29), so the wheel cannot be built
+          # with them. Testing the Conan path here while shipping the bundled
+          # one would leave the released configuration untested.
+          - os: ubuntu-latest
+            bundled: "ON"
+            profile: ""
+            conan_build: ""
+            label: ubuntu x86_64 / bundled
+          # macOS is bundled so the wheel matches omle-runtime's reach.
+          # ConanCenter's macOS arm64 binaries are all built with minos 14.0,
+          # so anything linking them inherits a macOS 14 floor, while
+          # omle-runtime — which builds its dependencies from source — ships
+          # macosx_11_0_arm64. Building from source here buys back macOS 11,
+          # 12 and 13 at the cost of compile time.
+          - os: macos-latest
+            bundled: "ON"
+            profile: ""
+            conan_build: ""
+            label: macOS arm64 / bundled
+          - os: windows-latest
+            bundled: "OFF"
+            profile: windows-msvc
+            conan_build: never
+            label: windows / conan
+
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          path: omle-server
+      - uses: actions/checkout@v4.2.2
+        with:
+          repository: openmle/omle-runtime
+          path: omle-runtime
+      # omle-runtime's CMakeLists generates omle.pb.cc from this repository's
+      # schema, so it is needed even though nothing here is Python.
+      - uses: actions/checkout@v4.2.2
+        with:
+          repository: openmle/omle
+          path: omle
+
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: "3.12"
+
+      # Only the toolchain and the three libraries the bundled build still
+      # resolves against the system. gRPC, Abseil, protobuf, Drogon, jsoncpp
+      # and simdjson must NOT be installed: cmake/bundled_deps.cmake compiles
+      # them from pinned source, and finding a system copy instead is the
+      # silent failure this row exists to catch. publish.yml's manylinux step
+      # installs the same three and nothing more.
+      #
+      # libssl is external by design — a vendored copy stops receiving the
+      # distribution's security updates. uuid and zlib are Drogon's: its own
+      # CMakeLists calls find_package(UUID REQUIRED) and find_package(ZLIB
+      # REQUIRED) on Linux even when built from source.
+      # Linux builds its dependencies from pinned source, so only the
+      # toolchain and the three libraries that build still resolves against
+      # the system. gRPC, Drogon, protobuf, Abseil, jsoncpp and simdjson must
+      # NOT be installed: finding a system copy is the failure the bundled
+      # build exists to prevent. OpenSSL stays external by design, and Drogon
+      # calls find_package on UUID and ZLIB even when built from source.
+      - name: Install the toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libssl-dev uuid-dev zlib1g-dev
+
+      - name: Install the toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja openssl@3
+
+      - name: Cache the Conan package cache
+        if: matrix.bundled == 'OFF'
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ matrix.profile }}-${{ hashFiles('omle-server/conanfile.txt', format('omle-server/conan/profiles/{0}', matrix.profile)) }}
+
+      - name: Install dependencies (Conan)
+        if: matrix.bundled == 'OFF'
+        working-directory: omle-server
+        shell: bash
+        run: |
+          python3 -m pip install conan
+
+          # -pr:a, not `conan profile detect`, and not -s flags.
+          #
+          # :a applies the profile to the host *and* build contexts.
+          # [tool_requires] resolves in the build context, and settings passed
+          # with -s reach only the host, so a detected build profile kept
+          # cppstd=14 and protobuf and gRPC — which require 17 — were rejected
+          # outright: "Invalid: Current cppstd (14) is lower than the required
+          # C++ standard (17)". The host context failed more quietly, every
+          # package "Missing", because a profile differing in any setting
+          # yields package_ids nothing was ever built for.
+          #
+          # --build=never on the rows where nothing should need building, so a
+          # miss fails here in seconds naming the package rather than silently
+          # compiling gRPC from source and going green forty minutes later.
+          conan install . \
+            --output-folder=build/conan \
+            --build=${{ matrix.conan_build }} \
+            -pr:a=conan/profiles/${{ matrix.profile }}
+
+          # --build=missing is necessary here (OpenSSL has no prebuilt shared
+          # variant) but it is also silent: if the runner's compiler ever stops
+          # matching the profile, every package_id changes and Conan quietly
+          # compiles the whole graph — gRPC, Abseil, protobuf, boost — turning a
+          # three-minute job into an hour-long one that still passes.
+          #
+          # So the expensive packages are asserted to have come prebuilt. This
+          # fails in seconds with the resolved profile in the log, which is what
+          # you need to see to fix the pin.
+          # A relative path, not /tmp: this step runs under bash on every
+          # platform, but the heredoc below is interpreted by native Windows
+          # Python, which reads an absolute "/tmp/..." as C:\tmp\... and not
+          # as git-bash's /tmp. The redirect succeeded and the open() failed.
+          conan graph info . -pr:a=conan/profiles/${{ matrix.profile }} \
+            --format=json > build/conan-graph.json
+          python3 - <<'PYEOF'
+          import json
+          g = json.load(open("build/conan-graph.json"))
+          prebuilt = {"Download", "Cache", "Skip", "Platform"}
+          expensive = {"grpc", "protobuf", "abseil", "drogon", "boost"}
+          built = sorted({n.get("name") for n in g["graph"]["nodes"].values()
+                          if n.get("binary") and n["binary"] not in prebuilt
+                          and n.get("name") in expensive})
+          if built:
+              raise SystemExit(
+                  f"::error::{built} would be built from source. The profile no "
+                  "longer matches what ConanCenter publishes — check the "
+                  "compiler version and cppstd above against conan/profiles/.")
+          print("expensive packages all prebuilt")
+          PYEOF
+
+      # The bundled rows fetch gRPC, Drogon, jsoncpp and simdjson from pinned
+      # source. Cloning gRPC's submodule tree — Abseil, protobuf, BoringSSL,
+      # re2, c-ares — dominates that work; it is the clone, not the compile.
+      # So this cache is what makes the bundled path affordable on every push.
+      #
+      # Keyed on bundled_deps.cmake, so bumping a pin there invalidates it and
+      # nothing else does.
+      - name: Cache fetched dependency sources
+        if: matrix.bundled == 'ON'
+        uses: actions/cache@v4
+        with:
+          path: omle-server/build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('omle-server/cmake/bundled_deps.cmake') }}
+
+      - name: Configure
+        working-directory: omle-server
+        shell: bash
+        # BUILD_SERVER_TESTS defaults OFF, so tests/ is not even added to the
+        # build without this; a run that forgot it would look green having
+        # compiled no test at all.
+        run: |
+          # No -G on Windows. CMake then defaults to the Visual Studio
+          # generator and builds with MSVC, which is what omle-runtime's
+          # Windows wheels and jar are built with. Forcing -G Ninja instead
+          # picks up whatever compiler is first on PATH — on the runner image
+          # that is MinGW GCC, giving a binary with a different C++ runtime
+          # than every other Windows artifact in the project.
+          #
+          # Visual Studio is a multi-config generator, so the build and test
+          # steps pass --config / --build-config rather than relying on
+          # CMAKE_BUILD_TYPE.
+          GEN="-G Ninja"
+          EXTRA=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GEN=""
+          fi
+          # macOS: pin the deployment target, or the wheel is stamped with the
+          # runner's OS version.
+          #
+          # Left unset, the compiler targets the build machine, and the runner
+          # is macOS 26. delocate derives the wheel's minimum OS from the
+          # binary, so 0.1.0rc5 shipped as
+          #
+          #   omle_server-0.1.0rc5-py3-none-macosx_26_0_arm64.whl
+          #
+          # installable only on macOS 26+. On anything older pip reports
+          # "Could not find a version that satisfies the requirement" — the
+          # project is found, no distribution matches.
+          #
+          # 11.0 matches omle-runtime, which ships macosx_11_0_arm64. It is
+          # reachable only because this row builds its dependencies from
+          # source; ConanCenter's macOS binaries carry minos 14.0 and would
+          # force a macOS 14 floor. 11.0 is the arm64 floor — no earlier macOS
+          # runs on Apple silicon.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export MACOSX_DEPLOYMENT_TARGET=11.0
+          fi
+          # Every Conan row, not just Windows: the generated toolchain is what
+          # points find_package at the downloaded packages.
+          if [ "${{ matrix.bundled }}" = "OFF" ]; then
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$PWD/build/conan/conan_toolchain.cmake"
+            # CMP0091 NEW is what lets the toolchain set the MSVC runtime
+            # through CMAKE_MSVC_RUNTIME_LIBRARY; without it the flag is baked
+            # into CMAKE_CXX_FLAGS instead and Conan's setting is ignored,
+            # giving a runtime mismatch against the downloaded binaries. It is
+            # a no-op off Windows.
+            EXTRA="$EXTRA -DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
+          fi
+          # The siblings are checked out at their default branch here, so a branch
+          # name would identify nothing: record the commits instead, so a failing
+          # run says exactly which sibling code it built against.
+          RT_SHA=$(git -C ../omle-runtime rev-parse --short HEAD)
+          OM_SHA=$(git -C ../omle rev-parse --short HEAD)
+          cmake -S . -B build $GEN $EXTRA \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SERVER_TESTS=ON \
+            -DOMLE_SERVER_BUNDLE_DEPS=${{ matrix.bundled }} \
+            -DOMLE_SERVER_OMLE_RUNTIME_REF="main@$RT_SHA" \
+            -DOMLE_SERVER_OMLE_REF="main@$OM_SHA"
+
+      - name: Build
+        working-directory: omle-server
+        shell: bash
+        # The default target, not just omle_server: the test executables are
+        # separate targets and `--target omle_server` would skip them.
+        # --config is required by the Visual Studio generator and ignored by
+        # Ninja, so one line serves both.
+        run: cmake --build build --config Release -j 4
+
+      - name: Assert the binary landed where the tests look for it
+        working-directory: omle-server
+        shell: bash
+        # python/tests/conftest.py SKIPS when it cannot find the binary, so
+        # without this check a build that produced nothing would report a green
+        # run with every integration test silently skipped.
+        run: |
+          # Both layouts are checked because both occur: Ninja writes to
+          # build/, while the Visual Studio generator is multi-config and
+          # writes to build/Release/. conftest.py searches the same pair.
+          #
+          # if/fi rather than `[ ... ] && BIN=...`: the runner runs bash with
+          # `set -e`, so a false test at the end of an && chain would exit
+          # non-zero and fail this step on every non-Windows row.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            NAME=omle_server.exe
+          else
+            NAME=omle_server
+          fi
+          FOUND=""
+          for c in "build/$NAME" "build/Release/$NAME"; do
+            if [ -f "$c" ]; then FOUND="$c"; break; fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::no $NAME in build/ or build/Release/"
+            exit 1
+          fi
+          echo "$FOUND present"
+
+      - name: C++ unit tests
+        working-directory: omle-server/build
+        run: ctest --output-on-failure --build-config Release
+
+      - name: Install the Python test dependencies
+        working-directory: omle-server/python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: REST and gRPC integration tests
+        working-directory: omle-server/python
+        # These start build/omle_server once per session and drive it over both
+        # protocols, so they are the only check that the two OIP surfaces agree
+        # with each other and with the runtime.
+        run: pytest -q
+
+  # ---------------------------------------------------------------------------
+  # Docker image — builds docker/Dockerfile and proves the result actually
+  # serves, not merely that it compiled.
+  #
+  # This is the slowest job here by a wide margin: the image builds every
+  # dependency from pinned source, and cloning gRPC's submodule tree (Abseil,
+  # protobuf, BoringSSL, re2, c-ares) dominates. The buildx cache below is what
+  # keeps repeat runs bearable — a push that touches neither the Dockerfile nor
+  # cmake/ reuses the dependency layers and only recompiles the server.
+  #
+  # Nothing else in this repository builds the image, so without this job a
+  # broken base-image assumption — a renamed package, an OpenSSL soname change —
+  # would surface first for whoever ran `docker build`, not in CI.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    needs: changes
+    # Skipped rather than failed when nothing image-affecting changed, so the
+    # job shows as skipped on ordinary pushes and does not gate a merge.
+    if: needs.changes.outputs.docker == 'true'
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      # The Dockerfile clones omle-runtime and omle itself, at the refs pinned
+      # in its ARGs, so unlike the build-and-test job this one needs no sibling
+      # checkouts.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true          # into the local daemon, so the next step can run it
+          push: false
+          tags: omle-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # The Dockerfile clones the siblings at main, and that RUN's text does
+          # not change when main does — so a cached clone layer would be reused
+          # and the weekly canary would re-verify last week's sources. Only the
+          # scheduled run pays for a cold build; path-triggered builds, where
+          # the change under test is in this repository, keep the cache.
+          no-cache: ${{ github.event_name == 'schedule' }}
+
+      # A build that succeeds and an image that works are different claims. The
+      # binary is statically linked against everything except OpenSSL and libc,
+      # so the failure this catches is a runtime stage missing a shared library
+      # the builder had — which a build alone cannot detect.
+      - name: Run the image and check it serves
+        run: |
+          mkdir -p /tmp/models
+          cp tests/data/*.omle /tmp/models/
+
+          docker run -d --name omle-ci \
+            -v /tmp/models:/models:ro \
+            -p 18080:8080 -p 18081:8081 \
+            omle-server:ci
+
+          # Poll rather than sleep: the model registry loads before the REST
+          # listener answers ready, and how long that takes depends on the
+          # runner.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/v2/health/ready >/dev/null 2>&1; then
+              echo "ready after ${i}s"; break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::server did not become ready"
+              docker logs omle-ci; exit 1
+            fi
+            sleep 1
+          done
+
+          # /ready alone would pass with an empty registry, so assert the model
+          # mounted from the volume is actually loaded and answering.
+          curl -fsS http://127.0.0.1:18080/v2/models/test_model_2f/ready
+          curl -fsS http://127.0.0.1:18080/v2/models/test_model_2f | tee /tmp/meta.json
+          grep -q '"name":"test_model_2f"' /tmp/meta.json \
+            || { echo "::error::model metadata missing"; exit 1; }
+
+      # The image claims to be self-contained apart from OpenSSL and system
+      # libraries. Checked here rather than trusted: the builder stage asserts
+      # the same thing, but only this step sees the runtime image, where a
+      # missing library shows up as an unresolved dependency.
+      - name: Assert the runtime image resolves every library
+        run: |
+          docker run --rm --entrypoint sh omle-server:ci -c \
+            'ldd /usr/local/bin/omle-server' | tee /tmp/ldd.txt
+          if grep -q "not found" /tmp/ldd.txt; then
+            echo "::error::unresolved shared libraries in the runtime image"
+            exit 1
+          fi
+          echo "all libraries resolve"
+
+      - name: Image size
+        run: docker image ls omle-server:ci --format '  {{.Repository}}:{{.Tag}}  {{.Size}}'
+
+      - name: Stop
+        if: always()
+        run: docker rm -f omle-ci 2>/dev/null || true

@@ -1,0 +1,48 @@
+# Conan profile for the macOS arm64 CI job. Pinned, not detected.
+#
+# See linux-gcc13 for why cppstd is gnu17 rather than 17.
+#
+# apple-clang 17 is what ConanCenter built gRPC, Drogon, protobuf, Abseil and
+# OpenSSL with. Two packages in the graph do not match it and are compiled from
+# source instead:
+#
+#   simdjson      its macOS binary was built with apple-clang 13 at cppstd=17,
+#                 a different build epoch; no single profile satisfies both it
+#                 and gRPC.
+#   libbacktrace  ConanCenter publishes no macOS arm64 binary at all.
+#
+# Both are small — one translation unit and a small C library — so the CI job
+# passes --build=missing rather than --build=never here. That is a deliberate
+# difference from Windows and Linux, where --build=never is correct because
+# nothing should ever need building and a miss must fail loudly.
+
+[settings]
+os=Macos
+arch=armv8
+compiler=apple-clang
+compiler.version=17
+compiler.cppstd=gnu17
+compiler.libcxx=libc++
+build_type=Release
+
+# OpenSSL is the one dependency taken as a shared library, so the binary links
+# it dynamically and picks up the system copy at runtime rather than freezing a
+# crypto library into the wheel. auditwheel and delocate exclude it for exactly
+# that reason, and the wheel then resolves libssl at load time against whatever
+# the machine provides.
+#
+# ConanCenter publishes no shared OpenSSL for this configuration, so it is
+# compiled from source — which is why the CI job passes --build=missing here
+# rather than --build=never. It is one package; gRPC, protobuf, Abseil, Drogon
+# and boost are still downloaded prebuilt.
+#
+# Declaring it platform-provided instead would have avoided even that build,
+# but does not work: gRPC's recipe declares a component requirement on
+# openssl::ssl, and CMakeDeps refuses to generate for a dependency that is not
+# in the graph —
+#   "component '_grpc' required 'openssl::ssl', but 'openssl' is not a direct
+#    dependency"
+# Adding openssl to [requires] as well does not help; platform_requires removes
+# it from the graph either way.
+[options]
+openssl/*:shared=True

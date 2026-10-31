@@ -1,0 +1,12 @@
+# Google C++ Style Guide, strictly.
+# https://google.github.io/styleguide/cppguide.html
+#
+# Adopted before the first release, while reformatting is cheap. Key points
+# this enforces: 2-space indentation, 80-column limit, attached braces,
+# and Google's #include ordering.
+#
+# Run over the tree with:
+#   find src include tests examples -name '*.cpp' -o -name '*.h' | xargs clang-format -i
+---
+Language: Cpp
+BasedOnStyle: Google

@@ -1,0 +1,25 @@
+{
+  "model_dir":             "/models",
+  "rest_port":             8080,
+  "grpc_port":             8081,
+  "rest_threads":          0,
+  "grpc_threads":          0,
+  "model_n_threads":       1,
+  "run_verification":      true,
+
+  "batching_enabled":      false,
+  "max_batch_size":        32,
+  "batch_timeout_ms":      5,
+
+  "model_configs": {
+    "iris":   { "max_batch_size": 64, "batch_timeout_ms": 10 },
+    "resnet": { "max_batch_size": 16, "batch_timeout_ms": 20 }
+  },
+
+
+  "inference_timeout_ms":  30000,
+
+  "log_level":             "info",
+  "server_name":           "omle-server",
+  "server_version":        "0.1.0"
+}

@@ -1,0 +1,28 @@
+# Conan profile for the Windows CI job. Pinned, not detected.
+#
+# `conan profile detect` produced a different configuration on the runner than
+# the one these pins were verified against, and every package came back
+# "Missing" — not an error in Conan's eyes, just a package_id nothing was built
+# for. The two that differ most:
+#
+#   cppstd    detect picks 14 for msvc. The project is C++17 everywhere
+#             (CMAKE_CXX_STANDARD 17) and ConanCenter builds these at 17;
+#             protobuf and gRPC additionally *require* 17 and report
+#             "Invalid: Current cppstd (14) is lower than the required C++
+#             standard (17)".
+#   version   194 is what ConanCenter publishes msvc binaries for. A runner
+#             reporting a newer toolset yields package_ids nothing matches.
+#             Pinning is safe: MSVC is binary compatible forward from VS2015,
+#             so a newer compiler links 194-built libraries fine.
+#
+# runtime=dynamic matches CMake's Release default (/MD) and the downloaded
+# libraries, which all carry RuntimeLibrary=MD_DynamicRelease.
+
+[settings]
+os=Windows
+arch=x86_64
+compiler=msvc
+compiler.version=194
+compiler.cppstd=17
+compiler.runtime=dynamic
+build_type=Release

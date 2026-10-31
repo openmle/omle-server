@@ -1,0 +1,42 @@
+# Conan profile for the Linux x86_64 CI job. Pinned, not detected.
+#
+# cppstd is gnu17, not 17. ConanCenter builds its Linux and macOS binaries
+# with GNU extensions; only the Windows ones use plain 17, because MSVC has no
+# gnu variant. Getting this wrong is silent: every package reports "Missing",
+# which is not an error to Conan — it just builds from source instead, which is
+# the slow path this profile exists to avoid.
+#
+# gcc 13 is what ConanCenter publishes for. A runner with a newer gcc links
+# these fine; the libstdc++ ABI has been stable since gcc 5, and the project
+# compiles its own sources with the runner's compiler either way.
+
+[settings]
+os=Linux
+arch=x86_64
+compiler=gcc
+compiler.version=13
+compiler.cppstd=gnu17
+compiler.libcxx=libstdc++11
+build_type=Release
+
+# OpenSSL is the one dependency taken as a shared library, so the binary links
+# it dynamically and picks up the system copy at runtime rather than freezing a
+# crypto library into the wheel. auditwheel and delocate exclude it for exactly
+# that reason, and the wheel then resolves libssl at load time against whatever
+# the machine provides.
+#
+# ConanCenter publishes no shared OpenSSL for this configuration, so it is
+# compiled from source — which is why the CI job passes --build=missing here
+# rather than --build=never. It is one package; gRPC, protobuf, Abseil, Drogon
+# and boost are still downloaded prebuilt.
+#
+# Declaring it platform-provided instead would have avoided even that build,
+# but does not work: gRPC's recipe declares a component requirement on
+# openssl::ssl, and CMakeDeps refuses to generate for a dependency that is not
+# in the graph —
+#   "component '_grpc' required 'openssl::ssl', but 'openssl' is not a direct
+#    dependency"
+# Adding openssl to [requires] as well does not help; platform_requires removes
+# it from the graph either way.
+[options]
+openssl/*:shared=True
