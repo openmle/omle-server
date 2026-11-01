@@ -343,6 +343,11 @@ jobs:
           # runs on Apple silicon.
           if [ "$RUNNER_OS" = "macOS" ]; then
             export MACOSX_DEPLOYMENT_TARGET=11.0
+            # Homebrew's `openssl` is now openssl@4, which the runner also has,
+            # and find_package(OpenSSL) picks it over the openssl@3 installed
+            # above. gRPC does not compile against OpenSSL 4
+            # (X509_CRL_get_issuer returns const there), so pin the root.
+            EXTRA="-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
           fi
           # Every Conan row, not just Windows: the generated toolchain is what
           # points find_package at the downloaded packages.
