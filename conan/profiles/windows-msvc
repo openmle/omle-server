@@ -26,3 +26,12 @@ compiler.version=194
 compiler.cppstd=17
 compiler.runtime=dynamic
 build_type=Release
+
+# The Visual Studio IDE to drive builds with, separate from the compiler
+# above. compiler.version=194 maps to the "Visual Studio 17 2022" generator by
+# default, and windows-latest now carries Visual Studio 2026 only, so the first
+# package built from source (drogon) failed with "could not find any instance
+# of Visual Studio". 18 selects "Visual Studio 18 2026" while the toolset stays
+# v143 (14.44), which that image installs as a component.
+[conf]
+tools.microsoft.msbuild:vs_version=18

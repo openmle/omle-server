@@ -172,7 +172,9 @@ jobs:
           - os: windows-latest
             bundled: "OFF"
             profile: windows-msvc
-            conan_build: never
+            # drogon is pinned to 1.9.12, which ConanCenter has no msvc
+            # binary for (see conanfile.txt), so it alone is built.
+            conan_build: "missing:drogon/*"
             label: windows / conan
 
 
@@ -275,7 +277,9 @@ jobs:
           import json
           g = json.load(open("build/conan-graph.json"))
           prebuilt = {"Download", "Cache", "Skip", "Platform"}
-          expensive = {"grpc", "protobuf", "abseil", "drogon", "boost"}
+          # drogon is not in the set: it is built from source on purpose
+          # (see conanfile.txt), and it is small next to these.
+          expensive = {"grpc", "protobuf", "abseil", "boost"}
           built = sorted({n.get("name") for n in g["graph"]["nodes"].values()
                           if n.get("binary") and n["binary"] not in prebuilt
                           and n.get("name") in expensive})

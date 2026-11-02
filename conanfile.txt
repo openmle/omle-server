@@ -35,7 +35,12 @@
 
 [requires]
 grpc/1.83.1
-drogon/1.9.13
+# 1.9.12, the bundled pin, and not 1.9.13: Linux and macOS build 1.9.12 from
+# source and pass, while the Windows server linking ConanCenter's 1.9.13
+# crashed with 0xC0000005 while serving REST requests. ConanCenter has no
+# msvc binary for 1.9.12, so the Windows rows build drogon (only) from
+# source: conan_build is "missing:drogon/*" there.
+drogon/1.9.12
 simdjson/3.13.0
 nlohmann_json/3.11.3
 gtest/1.17.0
